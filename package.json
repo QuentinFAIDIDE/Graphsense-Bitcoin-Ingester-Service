@@ -1,0 +1,23 @@
+{
+  "name": "graphsense-btc-ingester-service",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "mocha"
+  },
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "mocha": "^9.0.0"
+  },
+  "dependencies": {
+    "concurrent-queue": "^7.0.2",
+    "csv-string": "^4.0.1",
+    "eslint": "^4.19.1",
+    "express-cassandra": "^2.6.0",
+    "randomstring": "^1.2.1",
+    "redis": "^3.1.2",
+    "request": "^2.88.2"
+  }
+}
