@@ -45,6 +45,7 @@ class CassandraWriter {
         this._summaryStatisticsModels = {};
         this._blockModels = {};
         this._blockTransactionsModels = {};
+        this._exchangeRatesModels= {};
         this._cassandraDriversTimestamps = {};
 
         // read the schema template synchronously
@@ -112,6 +113,15 @@ class CassandraWriter {
                 timestamp: "int"
             },
             key: ["height"]
+        };
+
+        this._exchangeRatesModel = {
+            fields: {
+                date: "text",
+                eur: "float",
+                usd: "float"
+            },
+            key: ["date"]
         };
 
         // block_transactions model
@@ -184,6 +194,7 @@ class CassandraWriter {
                                 this._blockModels[keyspace] = this._cassandraDrivers[keyspace].loadSchema("block", this._blockModel);
                                 this._blockTransactionsModels[keyspace] = this._cassandraDrivers[keyspace].loadSchema("block_transactions", this._blockTransactionsModel);
                                 this._summaryStatisticsModels[keyspace] = this._cassandraDrivers[keyspace].loadSchema("summary_statistics", this._summaryStatisticsModel);
+                                this._exchangeRatesModels[keyspace] = this._cassandraDrivers[keyspace].loadSchema("exchange_rates", this._exchangeRatesModel);
                                 // wait and start
                                 setTimeout(resolve, MIN_CLIENT_INIT_TIME-Math.abs(this._cassandraDriversTimestamps[keyspace]-Date.now()));
 
@@ -780,6 +791,29 @@ class CassandraWriter {
             delete this._receivedBlocksPerJob[jobname];
         if (this._jobErrors.hasOwnProperty(jobname) == true)
             delete this._jobErrors[jobname];
+    }
+
+    writeExchangeRates(keyspace, rates) {
+        return new Promise((resolve, reject)=>{
+            // where to store rows before pushing
+            let queries = [];
+
+            // for each row
+            for(let i=0;i<rates.length;i++) {
+                // push it for write
+                queries.push(new this._exchangeRatesModels[keyspace](rates[i]).save({return_query: true}));
+            }
+
+            // execute the bulk write
+            this._cassandraDrivers[keyspace].doBatch(queries, (err)=>{
+                if(err) {
+                    this._logErrors(err);
+                    reject(err);
+                } else {
+                    resolve();
+                }
+            });
+        });
     }
 
 }

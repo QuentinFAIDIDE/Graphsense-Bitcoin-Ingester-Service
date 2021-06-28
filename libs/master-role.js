@@ -1,10 +1,14 @@
 var redis = require("redis");
 var randomstring = require("randomstring");
 var request =require("request");
+var { CassandraWriter } = require("./cassandra-writer.js");
 
 var MASTER_JOBCHECK_INTERVAL = 60000;
 var CALLROLL_DELAY = 3000;
 var BLOCK_BATCH_SIZE = 50;
+var MIN_RATE_DATE = "2010-10-17";
+
+var MAX_TODO_STACK_LEN = 10;
 
 class MasterRole {
     /*
@@ -46,6 +50,8 @@ class MasterRole {
         });
 
         this._workersIds = [];
+
+        this._cassandraWriter = new CassandraWriter(redisHost,redisPort, symbol, logMessage, logErrors, debug);
     }
 
     // PRIVATE METHODS
@@ -107,60 +113,166 @@ class MasterRole {
                     return;
                 }
                 
-                // get all keyspaces JSONs objects on watch list
-                this._getMonitoredKeyspaces().then((keyspaces)=>{
-                    this._debug("Keyspaces monitored found: "+JSON.stringify(keyspaces));
-                    // create a mult to bulk redis calls
-                    let mult = this._redisClient.multi();
-                    // for each one, if it has been marked as to update continously
-                    for(let i=0; i<keyspaces.length;i++) {
-                        if(keyspaces[i].feedFrom!=-1) {
-                            // if last block availabl minus confirm delay is bigger than last keyspace block
-                            if(Number(keyspaces[i].lastWrittenBlock) < Number(maxheight) - Number(keyspaces[i].delay)) {
-                                // push a job for the new block
-                                let range = [Number(keyspaces[i].lastWrittenBlock)+1 ,Number(maxheight) - Number(keyspaces[i].delay)];
-                                
-                                let jobname = keyspaces[i].name+"::FILL_BLOCK_RANGE::"+range[0]+","+range[1];
-                        
-                                // split job into subtask of blck size
-                                let furthest_block_sent = Number(range[0]-1);
-                                let end = Number(range[1]);
-                                let split_size = BLOCK_BATCH_SIZE;
-                                while ((furthest_block_sent + split_size) <= end) {
-                                    // sending job for subrange
-                                    jobname = keyspaces[i].name+"::FILL_BLOCK_RANGE::"+
-                                        (furthest_block_sent+1)+","+String(furthest_block_sent + split_size);
-                                    // push the job in the redis bulk call objects
-                                    mult.lpush(this._currency.toUpperCase()+"::jobs::todo", jobname);
-                                    // increment to next batch
-                                    furthest_block_sent += split_size;
-                                }
+                this._redisClient.llen(""+this._currency.toUpperCase()+"::jobs::todo", (errLLE, todoStackLength)=>{
+                    if(errLLE) {
+                        reject(errLLE);
+                        return;
+                    }
+                    // get all keyspaces JSONs objects on watch list
+                    this._getMonitoredKeyspaces().then((keyspaces)=>{
+                        this._debug("Keyspaces monitored found: "+JSON.stringify(keyspaces));
+                        // create a mult to bulk redis calls
+                        let mult = this._redisClient.multi();
+                        // for each one, if it has been marked as to update continously
+                        for(let i=0; i<keyspaces.length;i++) {
+                            if(keyspaces[i].feedFrom!=-1) {
+                                // if last block availabl minus confirm delay is bigger than last keyspace block
+                                if(Number(keyspaces[i].lastWrittenBlock) < Number(maxheight) - Number(keyspaces[i].delay)) {
+                                    // push a job for the new block
+                                    let range = [Number(keyspaces[i].lastWrittenBlock)+1 ,Number(maxheight) - Number(keyspaces[i].delay)];
+                                    
+                                    let jobname = keyspaces[i].name+"::FILL_BLOCK_RANGE::"+range[0]+","+range[1];
 
-                                // if there is a remainder, send it as well
-                                if (furthest_block_sent < end) {
-                                    // sending job for subrange
-                                    jobname = keyspaces[i].name+"::FILL_BLOCK_RANGE::"+
-                                        (furthest_block_sent+1)+","+(end);
-                                    // push the job in the redis bulk call objects
-                                    mult.lpush(this._currency.toUpperCase()+"::jobs::todo", jobname);
-                                }
+                                    let tasksPending = todoStackLength;
+                            
+                                    // split job into subtask of blck size
+                                    let furthest_block_sent = Number(range[0]-1);
+                                    let end = Number(range[1]);
+                                    let split_size = BLOCK_BATCH_SIZE;
+                                    while ((furthest_block_sent + split_size) <= end && tasksPending<MAX_TODO_STACK_LEN) {
+                                        tasksPending++;
+                                        // sending job for subrange
+                                        jobname = keyspaces[i].name+"::FILL_BLOCK_RANGE::"+
+                                            (furthest_block_sent+1)+","+String(furthest_block_sent + split_size);
+                                        // push the job in the redis bulk call objects
+                                        mult.rpush(this._currency.toUpperCase()+"::jobs::todo", jobname);
+                                        // increment to next batch
+                                        furthest_block_sent += split_size;
+                                    }
 
-                                // update the last written block for the keyspace
-                                mult.hset(this._currency.toUpperCase()+"::monitored::"+keyspaces[i].name, "lastWrittenBlock", range[1]);
+                                    // if there is a remainder, send it as well
+                                    if (furthest_block_sent < end && tasksPending<MAX_TODO_STACK_LEN) {
+                                        // sending job for subrange
+                                        jobname = keyspaces[i].name+"::FILL_BLOCK_RANGE::"+
+                                            (furthest_block_sent+1)+","+(end);
+                                        furthest_block_sent = end;
+                                        // push the job in the redis bulk call objects
+                                        mult.rpush(this._currency.toUpperCase()+"::jobs::todo", jobname);
+                                    }
+
+                                    // update the last written block for the keyspace
+                                    mult.hset(this._currency.toUpperCase()+"::monitored::"+keyspaces[i].name, "lastWrittenBlock", furthest_block_sent);
+                                }
+                                // if rates were not set
+                                if(keyspaces[i].hasOwnProperty("lastRatesWritten")==false) {
+                                    // get yesterdays date in YYYY-MM-DD format
+                                    let yestedayTxt = this._getYesterdayDateTxt();
+                                    // make the mult update the date before entering promise-waiting a state
+                                    mult.hset(this._currency.toUpperCase()+"::monitored::"+keyspaces[i].name, "lastRatesWritten", yestedayTxt);
+                                    // call the function to update all rates in this namespace
+                                    this._updateRatesForKeyspaceForRange(keyspaces[i].name, null, yestedayTxt);
+                                // else, check if some might be missing
+                                } else {
+                                    // get today's date minus one day
+                                    let yestedayTxt = this._getYesterdayDateTxt();
+                                    // get last rates written dates
+                                    let lastRatesWritten = keyspaces[i].lastRatesWritten;
+                                    // if some days are missing
+                                    if(yestedayTxt!=lastRatesWritten) {
+                                        // make the mult update the last date written
+                                        //   before entering a promise waiting state
+                                        mult.hset(this._currency.toUpperCase()+"::monitored::"+keyspaces[i].name, "lastRatesWritten", yestedayTxt);
+                                        // call the function to update rates in this namespace
+                                        this._updateRatesForKeyspaceForRange(keyspaces[i].name, lastRatesWritten, yestedayTxt);
+                                    }
+                                }
                             }
                         }
-                    }
-                    // execute the db calls
-                    mult.exec((errMult, resMult)=>{
-                        if(errMult) {
-                            this._logErrors(errMult);
-                        } else {
-                            this._debug("Succesfully updated monitored keyspaces and dead workers");
-                        }
+                        // execute the db calls
+                        mult.exec((errMult, resMult)=>{
+                            if(errMult) {
+                                this._logErrors(errMult);
+                            } else {
+                                this._debug("Succesfully updated monitored keyspaces and dead workers");
+                            }
+                        });
+
+                    }).catch(this._logErrors);
+                });
+            }).catch(this._logErrors);
+        }).catch(this._logErrors);
+    }
+
+    // simply returns yesterday's date in a YYYY-MM-DD format
+    _getYesterdayDateTxt() {
+        let yesterday = new Date(Date.now()-(60000*60*24));
+        return this._dayAsText(yesterday);
+    }
+
+    // get the day of the date ass YYYY-MM-DD
+    _dayAsText(date) {
+        let month = date.getMonth()+1;
+        let monthTxt;
+        if(String(month).length==1) {
+            monthTxt = "0"+month;
+        } else {
+            monthTxt = String(month);
+        }
+        let day = date.getDate();
+        let dayTxt;
+        if(String(dayTxt).length==1) {
+            dayTxt = "0"+day;
+        } else {
+            dayTxt = String(day);
+        }
+        return ""+date.getFullYear()+"-"+monthTxt+"-"+dayTxt;
+    }
+
+
+    _updateRatesForKeyspaceForRange(keyspace, from, to) {
+        if(from==null) {
+            from = MIN_RATE_DATE;
+        }
+        this._debug("Updating rates from "+from+" to "+to);
+        // prepare the keyspace
+        this._cassandraWriter.prepareForKeyspace(keyspace).then(()=>{
+            // once its ready, get the btc rates
+            this._getRatesFromCoindesk("EUR" ,from, to).then((eur_rates)=>{
+                this._getRatesFromCoindesk("USD" ,from, to).then((usd_rates)=>{
+                    // for each rate received, push it in cassandra
+                    Object.keys(usd_rates).forEach((key)=>{
+                        this._cassandraWriter.writeExchangeRates(keyspace, [{
+                            date: key,
+                            eur: eur_rates[key],
+                            usd: usd_rates[key]
+                        }]).catch(this._logErrors);
                     });
                 }).catch(this._logErrors);
             }).catch(this._logErrors);
         }).catch(this._logErrors);
+    }
+
+    _getRatesFromCoindesk(symbol, from, to) {
+        return new Promise((resolve,reject)=>{
+            let useragent = "Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:47.0) Gecko/20100101 Firefox/47.0";
+            let url = "https://api.coindesk.com/v1/bpi/historical/close.json"+
+            "?index=USD&currency="+symbol+
+            "&start="+from+"&end="+to;
+            console.log(url);
+            request(url, {headers: {
+                "User-Agent": useragent
+            }}, (err, resp, body)=>{
+                if(err) {
+                    reject(err);
+                    return;
+                }
+                if(resp.statusCode!=200) {
+                    reject("Unexpected status code:"+resp.statusCode);
+                    return;
+                }
+                resolve(JSON.parse(body).bpi);
+            });     
+        });
     }
 
     _getLastAvailableBlock() {

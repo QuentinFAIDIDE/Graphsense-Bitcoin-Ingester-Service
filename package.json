@@ -18,6 +18,7 @@
     "express-cassandra": "^2.6.0",
     "randomstring": "^1.2.1",
     "redis": "^3.1.2",
-    "request": "^2.88.2"
+    "request": "^2.88.2",
+    "yahoo-finance": "^0.3.7"
   }
 }
