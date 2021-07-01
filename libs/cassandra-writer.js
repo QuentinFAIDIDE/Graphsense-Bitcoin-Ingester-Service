@@ -485,12 +485,12 @@ class CassandraWriter {
                     row = {
                         tx_prefix: jsonObj.hash.substring(0,5),
                         tx_hash: Buffer.from(jsonObj.hash,"hex"),
-                        tx_index: null,
+                        tx_index: ExpressCassandra.datatypes.Long.fromString(this._generateTxIndex(jobname, jsonObj.block_number),10),
                         height: jsonObj.block_number,
                         timestamp: jsonObj.block_timestamp,
                         coinbase: jsonObj.coinbase,
-                        total_input: ExpressCassandra.datatypes.Long.fromInt(jsonObj.input_value,10),
-                        total_output: ExpressCassandra.datatypes.Long.fromInt(jsonObj.output_value,10),
+                        total_input: ExpressCassandra.datatypes.Long.fromInt(jsonObj.input_value),
+                        total_output: ExpressCassandra.datatypes.Long.fromInt(jsonObj.output_value),
                         inputs: this._inputConvertETLtoGraphSense(jsonObj.inputs),
                         outputs: this._inputConvertETLtoGraphSense(jsonObj.outputs),
                         coinjoin: false
@@ -563,6 +563,16 @@ class CassandraWriter {
                 }
             }
         });
+    }
+
+    // this function generate id with format [HEIGHT]0..0[TX_COUNT] as string
+    _generateTxIndex(jobname, height) {
+        // get the tx count for this block as a string
+        let txid = String(this._blockTransactionMaps[jobname][height].writen_tx);
+        // we want to have a fixed string length and will pad with zeros 
+        while(txid.length<5) txid = "0"+txid;
+        // now we can return the id
+        return ""+height+txid;
     }
 
     _startRecoveringWriteErrors(keyspace, jobname) {
