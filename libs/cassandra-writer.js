@@ -2,12 +2,15 @@ const redis = require("redis");
 var ExpressCassandra = require("express-cassandra");
 const fs = require("fs");
 const { exec } = require("child_process");
+const { type } = require("os");
 
 var MIN_CLIENT_INIT_TIME = 10000;
 var MAX_RETRY_CASSANDRA = 50;
 
-var KEYSPACE_REGEXP = /^[A-Za-z0-9_]{1,48}$/;
+var KEYSPACE_REGEXP = /^[a-z0-9_]{1,48}$/;
 
+var DUMP_METRICS = process.env.DUMP_METRICS;
+if(DUMP_METRICS!="true")DUMP_METRICS="false"; 
 
 var address_types = {
     "nonstandard": 1,
@@ -21,9 +24,6 @@ var address_types = {
     "witness_scripthash": 9,
     "witness_unknown": 10
 };
-
-// trick for the enum to work on the json-like ETL format
-let None = null;
 
 class CassandraWriter {
     /*
@@ -60,7 +60,8 @@ class CassandraWriter {
             localDataCenter: process.env.CASSANDRA_DATACENTER,
             queryOptions: {consistency: ExpressCassandra.consistencies.one},
             socketOptions: {
-                connectTimeout: 15000
+                connectTimeout: 60000,
+                readTimeout: 120000
             }
         };
         this._ormOptions = {
@@ -136,15 +137,13 @@ class CassandraWriter {
             key: ["height"]
         };
 
-        this._csvHeaderPrefix = "hash,size,stripped_size";
-
         this._jobErrors = {};
         this._totalBlocksPerJob = {};
         this._writtenBlocksPerJob = {};
         this._receivedBlocksPerJob = [];
         this._blockTransactionMaps = {};
         this._garbageCollection = {};
-        this._jobWriteRetryStack = {};
+        this._jobCassandraIORetryStack = {};
         this._jobDoneCallbacks = {};
         this._jobTxCount = {};
     }
@@ -177,6 +176,9 @@ class CassandraWriter {
                                     reject("Error while creating cassandra schema:"+errCQLSH);
                                     return;
                                 }
+
+                                this._debug("Cassandra keyspace creation stderr:"+steCQLSH);
+                                this._debug("Cassandra keyspace creation stdout:"+stoCQLSH);
 
                                 // if not, create it and save the date
                                 this._cassandraDriversTimestamps[keyspace] = Date.now();
@@ -216,7 +218,7 @@ class CassandraWriter {
         });
     }
 
-    registerJob(jobname, callback) {
+    registerFillingJob(jobname, callback) {
         // create the error list to store job errors
         this._jobErrors[jobname] = [];
         // now, create the job map for block
@@ -229,7 +231,7 @@ class CassandraWriter {
         this._writtenBlocksPerJob[jobname] = 0;
         // garbage collection for transactions
         this._garbageCollection[jobname] = [];
-        this._jobWriteRetryStack[jobname] = {
+        this._jobCassandraIORetryStack[jobname] = {
             "transaction": [],
             "block": [],
             "block_transactions": [],
@@ -245,7 +247,184 @@ class CassandraWriter {
         };
     }
 
-    getJobStatus(jobname) {
+    registerEnrichingJob(jobname, callback) {
+        // create the error list to store job errors
+        this._jobErrors[jobname] = [];
+
+        // get the range of blocks the job will need to cover
+        let range = jobname.split("::")[3].split(",");
+
+        this._totalBlocksPerJob[jobname] = (range[1]-range[0])+1;
+        this._writtenBlocksPerJob[jobname] = 0;
+
+        // in case we get a few cassandra errors
+        this._jobCassandraIORetryStack[jobname] = {
+            "input-reads": [],
+            "input-write": [],
+            "count": 0
+        };
+
+        // register end of job callback 
+        this._jobDoneCallbacks[jobname] = callback;
+
+        // get the keyspace
+        let keyspace = jobname.split("::")[0];
+
+        // start iterating over blocks for enrichment
+        this._iterateOverEnrichingBlocks(keyspace, jobname, Number(range[0]));
+    }
+
+    // TODO OPTIMIZATION: Launch block enrichment in parallell (todo after redis utxo cache setup)
+    _iterateOverEnrichingBlocks(keyspace, jobname, firstblock, i=0) {
+        this._debug("Iteration over block "+(Number(firstblock)+i));
+        let hasStoppedDueToError = false;
+        // launch the redis call to get all tx for this block
+        let multi = this._redisClient.multi();
+        multi.lrange(this._currency.toUpperCase()+"::"+keyspace+"::btxs::"+(Number(firstblock)+i), 0, -1);
+        multi.del(this._currency.toUpperCase()+"::"+keyspace+"::btxs::"+(Number(firstblock)+i));
+        multi.exec((errMul,resMul)=>{
+            if(errMul) {
+                this._logErrors("REDIS ERROR (_iterateOverEnrichingBlocks): "+errMul);
+                // if we activate the parallell enrichment later, we will need to
+                // watch for race condition on the error callback and clearing here
+                this._jobDoneCallbacks[jobname](errMul);
+                this._clearEnrichingJob(jobname);
+                return;
+            }
+
+            // we have the list of tx hash to find inputs for in the first resMul array member
+            
+            // if we have no tx, just skip to next block
+            if(resMul[0]==null || (Array.isArray(resMul[0]) && resMul[0].length==0)) {
+                this._debug("Block "+String(Number(firstblock)+i)+" was empty for job:"+jobname);
+                // if we are done
+                if((i+1)>=this._totalBlocksPerJob[jobname]) {
+                    // we can recover errors and terminate
+                    this._recoverEnrichJobErrors(keyspace, jobname);
+                    return;
+                // if blocks are remaining, go to next one
+                } else {
+                    this._iterateOverEnrichingBlocks(keyspace, jobname, firstblock, i+1);
+                    return;
+                }
+            }
+
+            let txToWrite = resMul[0].length;
+            let txProcessed = 0;
+
+            console.log("Block "+(firstblock+i)+" has "+ txToWrite + " txs to process");
+
+            // calback when a transaction is done
+            // success parameter is not used here but is necessary for the _findTxInputs function
+            let txDoneCallback = (success)=>{
+                txProcessed++;
+                if(txProcessed>=txToWrite) {
+                    // if we wrote all blocks
+                    if((i+1)>=this._totalBlocksPerJob[jobname]) {
+                        // we can recover errors and terminate
+                        this._recoverEnrichJobErrors(keyspace, jobname);
+                        return;
+                    // if blocks are remaining, do em too
+                    } else {
+                        this._iterateOverEnrichingBlocks(keyspace, jobname, firstblock, i+1);
+                        return;
+                    }
+                }
+            };
+
+            // for each transaction
+            for(let k=0;k<resMul[0].length;k++) {
+                // if an error has been thrown inside a child callback try to stop the operation
+                // (may be useless because the for loop will have likely finished  already 
+                // when the cassandra read callback will return)
+                if(hasStoppedDueToError==true)return;
+                let inputData;
+                try {
+                    // parse the tx inputs data
+                    inputData = JSON.parse(resMul[0][k]);
+                } catch(err) {
+                    this._logErrors("REDIS ERROR (_iterateOverEnrichingBlocks): corrupted tx input data in redis: "+err);
+                    // if we activate the parallell enrichment later, we will need to
+                    // watch for race condition on the error callback and clearing here
+                    hasStoppedDueToError=true;
+                    this._jobDoneCallbacks[jobname](err);
+                    this._clearEnrichingJob(jobname);
+                    return;
+                }
+
+                this._findTxInputs(keyspace, jobname, inputData, txDoneCallback);
+            }
+        });
+    }
+
+    _findTxInputs (keyspace, jobname, inputData, txDoneCallback, retry=false) {
+        console.log("Looking for input for tx: "+Buffer(inputData.h).toString("hex"));
+        let txFound = 0;
+        let txInputs = [];
+        let failedCassandraRead = false;
+        // input found callback
+        let foundInputCallback = ()=>{
+            console.log("Found one tx");
+            txFound++;
+            // if we found all inputs
+            if(txFound>=inputData.t.length) {
+                // if finding input failed
+                if(failedCassandraRead == true) {
+                    // save the task data to try to recover at the end
+                    if(retry==false)this._manageCassandraErrorsForJob(jobname, new Error("Cassandra: Unable to get inputs for tx"), inputData, "inputs-reads");
+                    // increase tx count
+                    txDoneCallback(false);
+                } else {
+                    // now, run the coinjoin algorithm on the in/outs
+                    let coinjoin = this._detectCoinjoin({inputs: txInputs, outputs: inputData.o});
+                    // and finally write the transaction
+                    this._transactionModels[keyspace].update({
+                        tx_prefix: Buffer(inputData.h).toString("hex").substring(0,5),
+                        tx_hash: Buffer(inputData.h)
+                    }, {
+                        inputs: txInputs,
+                        coinjoin: coinjoin
+                    }, function (err) {
+                        if(err) {
+                            if(retry==false)this._manageCassandraErrorsForJob(jobname, new Error("Cassandra: Unable to get inputs for tx"), 
+                                {tx_hash: inputData.h ,inputs:txInputs, coinjoin:coinjoin}, "input-write");
+                            // volontalery left no return here to keep on counting this tx as done (we'll retry at the end if error rate is low enought)
+                        }
+                        // increase tx count
+                        txDoneCallback(true);
+                    });
+                }
+            }
+        };
+
+        console.log("Inputdata:");
+        console.log(JSON.stringify(inputData));
+
+        // for each input in the tx
+        for(let j=0;j<inputData.t.length;j++) {
+            // TODO OPTIMIZATION: try using redis cache here first
+            console.log("Making request for input "+j);
+            // get corresponding UTXOs from cassandra
+            this._transactionModels[keyspace].findOne({
+                tx_prefix: inputData.t[j][0].substring(0,5),
+                tx_hash: Buffer.from(inputData.t[j][0], "hex")
+            }, { select: ["tx_prefix","tx_hash","outputs"]}, (err, transac)=>{
+                // if error, stop right away and push 
+                if(err) {
+                    failedCassandraRead=true;
+                    console.log("ceeeeer");
+                } else {
+                    // TODO: find out why request return null (failed write for filling ??)
+                    if(transac==null) console.log("Barbouze !");
+                    // if no error, get the right output and set it as the input
+                    txInputs[j] = transac.outputs[inputData.t[j][1]];
+                }
+                foundInputCallback();
+            });
+        }
+    }
+
+    getFillingJobStatus(jobname) {
         return new Promise((resolve, reject)=>{
             // This function should only be called after the job callback was triggered
 
@@ -253,28 +432,36 @@ class CassandraWriter {
             let errmsg;
             // returns null after clearing errors object for this jobname if no error
             if(this._jobErrors[jobname].length==0) {
-                this._clearJob(jobname);
+                this._clearFillingJob(jobname);
                 resolve(null);
             } else {
             // if error, return a custom error message with number of error and first one
                 errmsg = "There were "+this._jobErrors[jobname].length+" errors, first one being: "+this._jobErrors[jobname][0];
-                this._clearJob(jobname);
+                this._clearFillingJob(jobname);
                 resolve(errmsg);
             }
         });
     }
 
-    _clearJob(jobname) {
+    _clearFillingJob(jobname) {
         // clear all auxilary objects for this job
         delete this._blockTransactionMaps[jobname];
         delete this._writtenBlocksPerJob[jobname];
         delete this._totalBlocksPerJob[jobname];
         delete this._garbageCollection[jobname];
-        delete this._jobWriteRetryStack[jobname];
+        delete this._jobCassandraIORetryStack[jobname];
         delete this._jobDoneCallbacks[jobname];
         delete this._jobTxCount[jobname];
         delete this._receivedBlocksPerJob[jobname];
         delete this._jobErrors[jobname];
+    }
+
+    _clearEnrichingJob(jobname) {
+        delete this._jobErrors[jobname];
+        delete this._totalBlocksPerJob[jobname];
+        delete this._writtenBlocksPerJob[jobname];
+        delete this._jobCassandraIORetryStack[jobname];
+        delete this._jobDoneCallbacks[jobname];
     }
 
     parseBlock(keyspace, jobname, blockbuffer) {
@@ -287,11 +474,10 @@ class CassandraWriter {
         // create request object to bulk writes
         let queries = [];
 
-        // buffer to parse blocks
-        let blockObj = {};
-
         // for each line
         for(let i=0;i<lines.length;i++) {
+            // buffer to parse blocks
+            let blockObj = {};
             // ignore empty lines
             if(lines[i].length!=0) {
                 try {
@@ -310,7 +496,21 @@ class CassandraWriter {
                         this._blockTransactionMaps[jobname][blockObj.number].total_tx = blockObj.transaction_count;
                         // this is used to know when all tx have been written, failed or not
                         this._jobTxCount[jobname].txToWrite += blockObj.transaction_count;
-                    }
+                        
+                        // increment block count to know when all block were received
+                        this._receivedBlocksPerJob[jobname]++;
+                        if(this._receivedBlocksPerJob[jobname]>=this._totalBlocksPerJob[jobname]) {
+                            this._jobTxCount[jobname].blocks_finished = true;
+                        }
+
+                        // the following statement is if by any change on any chain there is a block with a few tx
+                        // and that these txs arrived before the block data
+
+                        // if we have finished the block, send it for a write
+                        if(this._blockTransactionMaps[jobname][blockObj.number].writen_tx>=this._blockTransactionMaps[jobname][blockObj.number].total_tx) {
+                            this._writeBlockTransactionSummary(keyspace, jobname, blockObj.number);
+                        }
+                    } else { this._debug("A block was received with already set total_tx !") }
                 } else {
                     // create the map to store transactions infos in their blocks
                     this._blockTransactionMaps[jobname][blockObj.number] = {
@@ -336,7 +536,7 @@ class CassandraWriter {
 
         // send the writes
         this._cassandraDrivers[keyspace].doBatch(queries, (err)=>{
-            if(err)this._manageWriteErrorsForJob(jobname, err, queries, "block");
+            if(err)this._manageCassandraErrorsForJob(jobname, err, queries, "block");
         });
     }
 
@@ -359,8 +559,18 @@ class CassandraWriter {
                 this._writeBlockTransactionSummary(keyspace, jobname, height);
             }
         } else {
-            // push an error
-            this._jobErrors[jobname].push("FATAL ERROR: A transaction was received before its block.");
+            // create the map to store transactions infos in their blocks
+            // voluntarely omit total_tx for block parser function to detect tx was received before the block
+            this._blockTransactionMaps[jobname][height] = {
+                writen_tx: 1,
+                tx_summary_list: [{
+                    tx_hash: hash,
+                    no_inputs: nin,
+                    no_outputs: nout,
+                    total_input: tin,
+                    total_output: tout
+                }]
+            };
         }
     }
 
@@ -373,9 +583,10 @@ class CassandraWriter {
         // now write the row
         row.save((err)=>{
             if(err) {
-                this._manageWriteErrorsForJob(jobname, err, [height], "block_transactions");
+                this._manageCassandraErrorsForJob(jobname, err, [height], "block_transactions");
                 return;
             }
+            
             // increment block summary written
             this._writtenBlocksPerJob[jobname]++;
 
@@ -386,10 +597,7 @@ class CassandraWriter {
                 if(this._jobTxCount[jobname].txReceived>=this._jobTxCount[jobname].txToWrite) {
                     // if all blocks have been received and filled with txs
                     if(this._jobTxCount[jobname].blocks_finished==true) {
-                        this._startRecoveringWriteErrors(keyspace, jobname);
-                    // in case of write finishing before tx aggreg in block_transactions
-                    } else {
-                        this._jobErrors.push("FATAL ERROR: transactions were all written before blocks were all received");
+                        this._recoverFillJobErrors(keyspace, jobname);
                     }
                 }
             } else {
@@ -410,24 +618,21 @@ class CassandraWriter {
         this._redisClient.publish("BTC::done", jobname);
     }
 
-    _manageWriteErrorsForJob(jobname, err, rows=null, table=null) {
+    _manageCassandraErrorsForJob(jobname, err, rows=null, table=null) {
         // in case of error, save it for the worker service to retrieev it later
         if(err) {
             this._logErrors("Cassandra error at write:"+err);
-            // if the error happens after the pipe have been cleared (shouldn't happen anymore)
+            // if the write was a pending one that hadn't been finished before another failure that cleared job memory
             if(typeof this._jobErrors[jobname] == "undefined") {
-                // activate emergency procedure to remove job from done stack and push it to errors
-                this._moveJobFromDoneToErrorStack(jobname);
-                // tell the cli clients about it (if they are listening)
-                this._redisClient.publish(""+jobname+"::errors",  "job failed to execute: "+jobname);
+                this._debug("Job "+jobname+" received a cassandra error after its termination.");
                 return;
             }
             //if the job is still running save the error if we didn't saved too much already
-            if(this._jobWriteRetryStack[jobname].count<MAX_RETRY_CASSANDRA) {
+            if(this._jobCassandraIORetryStack[jobname].count<MAX_RETRY_CASSANDRA) {
                 if(rows!=null) {
                     for(let i=0;i<rows.length;i++) {
-                        this._jobWriteRetryStack[jobname][table].push(rows[i]);
-                        this._jobWriteRetryStack[jobname].count++;
+                        this._jobCassandraIORetryStack[jobname][table].push(rows[i]);
+                        this._jobCassandraIORetryStack[jobname].count++;
                     }
                 }
             // if the job has reached maximum allowed write errors, push an error to the stack
@@ -470,14 +675,40 @@ class CassandraWriter {
         // parse lines
         let lines = String(txbuffer).split("\n");
 
+
+        // callbacks to send the writes once UTXO have been set/get in cache
+
+        let callbackWrite = ()=>{
+            // send the writes
+            this._cassandraDrivers[keyspace].doBatch(queries, (err)=>{
+                if(err)this._manageCassandraErrorsForJob(jobname, err, queries, "transaction");
+                // failure or not, we need to know when all tx have been received to start recovering
+                // hence the count and test
+                this._jobTxCount[jobname].txReceived+=queries.length;
+                if(this._jobTxCount[jobname].txReceived>=this._jobTxCount[jobname].txToWrite) {
+                    // if all blocks have been received and filled with txs
+                    if(this._jobTxCount[jobname].blocks_finished==true) {
+                        // if all block_transaction rows were written
+                        if(this._writtenBlocksPerJob[jobname]>=this._totalBlocksPerJob[jobname]) {
+                            // start the process of recovering eventual write errors and terminating job
+                            this._recoverFillJobErrors(keyspace, jobname);
+                        }
+                    }
+                }
+            });
+        };
+
+        // keep track of the tx to write and written
+        let txToWrite = 0;
+        let txWriten = 0;
+
         // create request object to bulk writes
-        let queries = [];
-        let row;
-        let jsonObj;
+        let queries = [];        
 
         // for each line
         for(let i=0;i<lines.length;i++) {
-
+            let row;
+            let jsonObj;
             // ignore headers
             if(lines[i]!="") {
                 try  {
@@ -488,7 +719,7 @@ class CassandraWriter {
                         tx_index: ExpressCassandra.datatypes.Long.fromString(this._generateTxIndex(jobname, jsonObj.block_number),10),
                         height: jsonObj.block_number,
                         timestamp: jsonObj.block_timestamp,
-                        coinbase: jsonObj.coinbase,
+                        coinbase: jsonObj.is_coinbase,
                         total_input: ExpressCassandra.datatypes.Long.fromInt(jsonObj.input_value),
                         total_output: ExpressCassandra.datatypes.Long.fromInt(jsonObj.output_value),
                         inputs: this._inputConvertETLtoGraphSense(jsonObj.inputs),
@@ -496,26 +727,62 @@ class CassandraWriter {
                         coinjoin: false
                     };
 
-                    // detect coinjoin
-                    row.coinjoin = this._detectCoinjoin(row);
+                    txToWrite++;
 
-                    // save the tx summary to our maps
-                    this._addTransactionToBlockSummary(keyspace, jobname, row.height, row.tx_hash,
-                        row.inputs.length, row.outputs.length, row.total_input,
-                        row.total_output);
+                    // try to see if input required are already in redis RAM cache, and push outputs in there
+                    this._getSetTxIO(row.coinbase ,row.tx_hash, jsonObj.inputs, row.outputs).then((txIOresponse)=>{
 
-                    // initalize cassandra row and prepare it to be sent with others
-                    queries.push( new this._transactionModels[keyspace](row).save({return_query: true}));
+                        txWriten++;
 
-                    // if the transaction was a garbage collection, clean the garbage
-                    if(garbageCollection==true) {
-                        this._debug("Garbage collection success with size:"+this._garbageCollection[jobname].length);
-                        this._garbageCollection[jobname] = [];
-                    }
+                        // if we found corresponding utxo in redis
+                        if(txIOresponse.input_filled==true) {
+                            // report the inputs data
+                            row.inputs = txIOresponse.inputs;
+                            // detect coinjoin
+                            row.coinjoin = this._detectCoinjoin(row);
+                            //if(DUMP_METRICS)this._redisClient.INCR("1st-input-cache::success",1);
+                        } else if(jsonObj.inputs.length!=0) {
+                            let inputList = [];
+                            // build input list
+                            for(let j=0;j<jsonObj.inputs.length;j++) {
+                                inputList.push([jsonObj.inputs[j].spent_transaction_hash,jsonObj.inputs[j].spent_output_index]);
+                            }
+                            // if not, mark this transaction for later enrichment
+                            this._redisClient.lpush(this._currency+"::"+keyspace+"::btxs::"+jsonObj.block_number, 
+                                JSON.stringify({h:row.tx_hash,t:inputList, o:row.outputs}), (errLP,resLP)=>{
+                                    if(errLP) {
+                                        this._logErrors("ERRROR: Unable to push block job data to redis:"+errLP);
+                                    }
+                                });
+                            //if(DUMP_METRICS)this._redisClient.INCR("1st-input-cache::failure",1);
+                        // a transaction can also have no input and be a coinbase
+                        } else {
+                            row.inputs = [];
+                            // obviously, a purely coinbase tx is not a coinjoin
+                            row.coinjoin = false;
+                        }
 
-                    if(this._garbageCollection[jobname].length!=0) {
-                        this._debug("A transaction worked despise the garbage collection list not being empty!!");
-                    }
+                        // save the tx summary to our maps
+                        this._addTransactionToBlockSummary(keyspace, jobname, row.height, row.tx_hash,
+                            row.inputs.length, row.outputs.length, row.total_input,
+                            row.total_output);
+
+                        // initalize cassandra row and prepare it to be sent with others
+                        queries.push( new this._transactionModels[keyspace](row).save({return_query: true}));
+
+                        // if the transaction was a garbage collection, clean the garbage
+                        if(garbageCollection==true) {
+                            this._garbageCollection[jobname] = [];
+                        }
+
+                        if(this._garbageCollection[jobname].length!=0) {
+                            this._logErrors("A transaction worked despise the garbage collection list not being empty!!");
+                            process.exit(1);
+                        }
+
+                        // if we are done, call the final callback
+                        if(txWriten>=txToWrite)callbackWrite();
+                    });
                 } catch(err) {
                     // this is a tricky part, our pipe sometimes break down lines
                     // we must collect the garbage and try to glue it into a valid json
@@ -528,7 +795,7 @@ class CassandraWriter {
                         this._debug("Approximate Tx Buffer size that failed to parse (bytes): "+ String(txbuffer).length*2);
                         // if the json was cut down, save the part that is broken
                         if(String(err).indexOf("Unexpected end of JSON input")!=-1 || 
-                           String(err).indexOf("in JSON at position")!=-1) {
+                        String(err).indexOf("in JSON at position")!=-1) {
                             this._garbageCollection[jobname].push(lines[i]);
                             // if we have garbage saved
                             if(this._garbageCollection[jobname].length>1) {
@@ -543,45 +810,115 @@ class CassandraWriter {
                 }
             }
         }
+    }
 
-        // send the writes
-        this._cassandraDrivers[keyspace].doBatch(queries, (err)=>{
-            if(err)this._manageWriteErrorsForJob(jobname, err, queries, "transaction");
-            // failure or not, we need to know when all tx have been received to start recovering
-            // hence the count and test
-            this._jobTxCount[jobname].txReceived+=queries.length;
-            if(this._jobTxCount[jobname].txReceived>=this._jobTxCount[jobname].txToWrite) {
-                // if all blocks have been received and filled with txs
-                if(this._jobTxCount[jobname].blocks_finished==true) {
-                    // if all block_transaction rows were written
-                    if(this._writtenBlocksPerJob[jobname]>=this._totalBlocksPerJob[jobname]) {
-                        this._startRecoveringWriteErrors(keyspace, jobname);
-                    }
-                // in case of write finishing before tx aggreg in block_transactions
-                } else {
-                    this._jobErrors.push("FATAL ERROR: transactions were all written before blocks were all received");
-                }
-            }
+    // save the tx_outputs in redis txhash::inputid - addresses_nb,addresses,value,type
+    // should take on about 1Gb of additional RAM not counting Redis fragmentation if saving
+    // 1000 blocks worth of tx output with required fields: 1000*2200*(7*(32+25+8+1)) = 1Gb
+    // out of 23 tx input sampled, 21 were referencing less than 1000 blocks old output
+    // so 1000 sounds like a good size/sucess compromise    
+    _getSetTxIO(coinbase ,tx_hash, inputs, outputs) {
+        return new Promise((resolve,reject)=>{
+            // TODO: implement bulked calls to a redis cache
+            resolve({input_filled:false});
         });
     }
 
     // this function generate id with format [HEIGHT]0..0[TX_COUNT] as string
     _generateTxIndex(jobname, height) {
-        // get the tx count for this block as a string
-        let txid = String(this._blockTransactionMaps[jobname][height].writen_tx);
+        let txid = "00000";
+        // in case the tx is the first, it should be set to zero 
+        if(this._blockTransactionMaps[jobname].hasOwnProperty(height)==false) {
+            txid = "0";
+        } else {
+            // get the tx count for this block as a string
+            txid = String(this._blockTransactionMaps[jobname][height].writen_tx);
+        }
+
         // we want to have a fixed string length and will pad with zeros 
         while(txid.length<5) txid = "0"+txid;
         // now we can return the id
         return ""+height+txid;
     }
 
-    _startRecoveringWriteErrors(keyspace, jobname) {
+    _recoverEnrichJobErrors(keyspace, jobname) {
 
         this._debug("Started error recovery routine...");
 
         let recoveredCount = 0;
         let failedCount = 0;
-        let totalToRecover = this._jobWriteRetryStack[jobname].count;
+        let totalToRecover = this._jobCassandraIORetryStack[jobname].count;
+
+        // if there are not errors to recover, do nufin
+        if(totalToRecover==0) {
+            this._debug("No error to recover, cleaning up job auxiliary objects...");
+            this._jobDoneCallbacks[jobname](null);
+            this._clearEnrichingJob(jobname);
+            return;
+        }
+
+        // callback to register successes and failures and detect the end
+        let recoveredCallback = (success)=>{
+            if(success==true) {
+                recoveredCount++;
+            } else {
+                failedCount++;
+            }
+            // if the two bulk calls are done
+            if((recoveredCount+failedCount)>=totalToRecover) {
+                // if we were unable to do the failed write again
+                // push a fatal job error
+                if(failedCount!=0) {
+                    // fire the end of job callback
+                    this._jobDoneCallbacks[jobname](new Error("FATAL ERROR: job had "+
+                    totalToRecover+" failed cassandra writes and could not recover some."+
+                    " Watch your cassandra error rate."));
+                    this._clearEnrichingJob(jobname);
+                    return;
+                } else {
+                    // fire the end of job callback
+                    this._jobDoneCallbacks[jobname](null);
+                    this._clearEnrichingJob(jobname);
+                    return;
+                }
+            }
+        };
+
+        // try to get input which failed again
+        for(let i=0;i<this._jobCassandraIORetryStack[jobname]["inputs-reads"].length;i++) {
+            // used to bulk calls
+            let inputData = this._jobCassandraIORetryStack[jobname]["inputs-reads"][i];
+            // call the function to do the cassandra requests
+            this._findTxInputs(keyspace, jobname, inputData, recoveredCount, true);
+        }
+
+        // try to recover tx writes
+        for(let i=0;i<this._jobCassandraIORetryStack[jobname]["input-write"].length;i++) {
+
+            let row = this._jobCassandraIORetryStack[jobname]["input-write"][i];
+
+            // send all the block transac
+            this._transactionModels[keyspace].update({
+                tx_prefix: row.tx_hash.toString("hex").substring(0,5),
+                tx_hash: row.tx_hash
+            }, {inputs: row.inputs, coinjoin: row.coinjoin}, (err)=>{
+                if(err) {
+                    this._logErrors(err);
+                    recoveredCallback(false);
+                } else {
+                    recoveredCallback(true);
+                }
+            });
+        }
+    }
+
+    _recoverFillJobErrors(keyspace, jobname) {
+
+        this._debug("Started error recovery routine...");
+
+        let recoveredCount = 0;
+        let failedCount = 0;
+        let totalToRecover = this._jobCassandraIORetryStack[jobname].count;
 
         // if there are not errors to recover, do nufin
         if(totalToRecover==0) {
@@ -615,9 +952,9 @@ class CassandraWriter {
 
         // send block_transactions for rewrite
         let blockTransacQueries = [];
-        for(let i=0;i<this._jobWriteRetryStack[jobname]["block_transactions"].length;i++) {
+        for(let i=0;i<this._jobCassandraIORetryStack[jobname]["block_transactions"].length;i++) {
             // used to bulk calls
-            let height = this._jobWriteRetryStack[jobname]["block_transactions"][i];
+            let height = this._jobCassandraIORetryStack[jobname]["block_transactions"][i];
             // push it to the list of calls to make
             blockTransacQueries.push(new this._blockTransactionsModels[keyspace]({
                 height: height,
@@ -636,9 +973,9 @@ class CassandraWriter {
 
         // send block for rewrite
         let blockQueries = [];
-        for(let i=0;i<this._jobWriteRetryStack[jobname]["block"].length;i++) {
+        for(let i=0;i<this._jobCassandraIORetryStack[jobname]["block"].length;i++) {
             // used to bulk calls
-            let row = this._jobWriteRetryStack[jobname]["block"][i];
+            let row = this._jobCassandraIORetryStack[jobname]["block"][i];
             // push it to the list of calls to make
             blockQueries.push(new this._blockModels[keyspace](row).save({return_query: true}));
         }
@@ -654,9 +991,9 @@ class CassandraWriter {
 
         // send block for rewrite
         let txQueries = [];
-        for(let i=0;i<this._jobWriteRetryStack[jobname]["transaction"].length;i++) {
+        for(let i=0;i<this._jobCassandraIORetryStack[jobname]["transaction"].length;i++) {
             // used to bulk calls
-            let row = this._jobWriteRetryStack[jobname]["transaction"][i];
+            let row = this._jobCassandraIORetryStack[jobname]["transaction"][i];
             // push it to the list of calls to make
             txQueries.push(new this._transactionModels[keyspace](row).save({return_query: true}));
         }
@@ -781,7 +1118,7 @@ class CassandraWriter {
         return true;
     }
 
-    clearJobIfExists(jobname) {
+    clearFillingJobIfExists(jobname) {
         // clear all auxilary objects for this job
         if (this._blockTransactionMaps.hasOwnProperty(jobname) == true)
             delete this._blockTransactionMaps[jobname];
@@ -791,8 +1128,8 @@ class CassandraWriter {
             delete this._totalBlocksPerJob[jobname];
         if (this._garbageCollection.hasOwnProperty(jobname) == true)
             delete this._garbageCollection[jobname];
-        if (this._jobWriteRetryStack.hasOwnProperty(jobname) == true)
-            delete this._jobWriteRetryStack[jobname];
+        if (this._jobCassandraIORetryStack.hasOwnProperty(jobname) == true)
+            delete this._jobCassandraIORetryStack[jobname];
         if (this._jobDoneCallbacks.hasOwnProperty(jobname) == true)
             delete this._jobDoneCallbacks[jobname];
         if (this._jobTxCount.hasOwnProperty(jobname) == true)

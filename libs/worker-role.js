@@ -8,7 +8,9 @@ const { exec } = require("child_process");
 const {CassandraWriter} = require("./cassandra-writer.js");
 const randomstring = require("randomstring");
 
-let MAX_JOBS_PER_REPLICA = 3;
+let MAX_JOBS_PER_REPLICA = 1;
+// the best value to avoid crashing a single bitcoin node
+let MAX_FILL_CONCURRENCY = 4;
 
 class WorkerRole {
     /*
@@ -99,17 +101,17 @@ class WorkerRole {
         // subscribe to the appropirate redis channel for redis replica scheduling
         this._subClient.subscribe(this._redisSchedulerChannel);
         // at this point, we will start looping over task to do
-        this._checkJobInterval = setInterval(()=>{this._checkForJobs();}, DELAY_CHECK_JOB);
+        this._checkJobInterval = setInterval(()=>{this._checkAvailabilityForWork();}, DELAY_CHECK_JOB);
     }
 
-    _checkForJobs() {
+    _checkAvailabilityForWork() {
         // if we have room left for a job
         if(this._jobCount<MAX_JOBS_PER_REPLICA) {
             // we start polling for one
             this._jobCount++;
             this._pollForJob(this._jobCount-1).then((jobname)=>{
                 if(jobname!="no job found")
-                    this._debug("Worker finished stream tx data for job:"+jobname);
+                    this._debug("Worker finished job:"+jobname);
                 this._jobCount--;
             }).catch((err)=>{
                 this._logErrors("Worker error for job:"+err);
@@ -123,7 +125,7 @@ class WorkerRole {
         return new Promise((resolve,reject)=>{
 
             // do a pull on the job list 
-            this._redisClient.lpop(""+this._currency+"::jobs::todo", (errBLP, resBLP)=>{
+            this._redisClient.lpop(""+this._currency.toUpperCase()+"::jobs::todo", (errBLP, resBLP)=>{
                 // error handling
                 if(errBLP) {
                     reject("REDIS ERROR (worker._pollForJob: "+errBLP);
@@ -146,19 +148,17 @@ class WorkerRole {
 
                     this._debug("received job: "+resBLP);
 
-                    // stream error updates to cli clients
+                    // stream updates to cli clients
                     this._redisClient.publish(""+this._currency.toUpperCase()+"::picked", resBLP);
 
-                    // filter the job type
+                    // parse job message
                     let jobFields = resBLP.split("::");
                     let parameters = jobFields[2].split(",");
 
-                    // detect test job
-                    if(jobFields[1]=="TEST_JOB") {
+                    if(jobFields[1]=="ENRICH_BLOCK_RANGE") {
                         // this job looks like:
-                        // TEST_NAME::TEST_JOB::integeridentifier,total
-                        // integer identifier are incremental 0 based ids
-                        this._startTestJob(jobFields[0], parameters[0], parameters[1]).then(()=>{
+                        // KEYSPACE_IDENTIFIER::ENRICH_BLOCK_RANGE::FIRST_BLOCK,LAST_BLOCK
+                        this._startEnrichJob(jobFields[0], parameters[0], parameters[1]).then(()=>{
                             resolve(resBLP);
                         }).catch((err)=>{
                             this._logErrors(err);
@@ -166,23 +166,63 @@ class WorkerRole {
                                 reject(err);
                             }).catch(reject);
                         });
-                    // detect real job
                     } else if (jobFields[1]=="FILL_BLOCK_RANGE") {
                         // this job looks like:
                         // KEYSPACE_IDENTIFIER::FILL_BLOCK_RANGE::FIRST_BLOCK,LAST_BLOCK
-                        this._startBlockRangeFillJob(jobFields[0], parameters[0], parameters[1]).then(()=>{
-                            resolve(resBLP);
-                        // in case of problem, move the job to the error stack
-                        }).catch((err)=>{
-                            this._logErrors(err);
-                            this._moveJobToErrorStack(resBLP).then(()=>{
-                                reject(err);
-                            }).catch(reject);
+                        this._getActiveJobsForTask("FILL_BLOCK_RANGE").then((fill_jobs_processing)=>{
+                            // if we have more than MAX_FILL_CONCURRENCY workers on the FILL_BLOCK_RANGE job
+                            if(fill_jobs_processing>=MAX_FILL_CONCURRENCY) {
+                                // if we push to the beginning we risk a race condition with an enrichment job push
+                                // if we push to the end, we will flip the fill jobs and delay next enrich jobs generation a bit
+                                // the best deal is to push to the beginning, it will create a one-filling-job skewness while flipping jobs order might create 10
+                                this._redisClient.lpush(""+this._currency.toUpperCase()+"::jobs::todo", resBLP, (errLPR, resLPR)=>{
+                                    if(errLPR) {
+                                        reject(errLPR);
+                                    } else {
+                                        resolve();
+                                    }
+                                });
+                            } else {
+                                this._startBlockRangeFillJob(jobFields[0], parameters[0], parameters[1]).then(()=>{
+                                    resolve(resBLP);
+                                // in case of problem, move the job to the error stack
+                                }).catch((err)=>{
+                                    this._logErrors(err);
+                                    this._moveJobToErrorStack(resBLP).then(()=>{
+                                        reject(err);
+                                    }).catch(reject);
+                                });
+                            }
                         });
                     }
                 } catch(err) {
                     reject(err);
                 }
+            });
+        });
+    }
+
+    _getActiveJobsForTask(task) {
+        return new Promise((resolve, reject)=>{
+            // get the list of jobs in the doing stack
+            this._redisClient.lrange(""+this._currency.toUpperCase()+"::jobs::doing", 0, 20, (errLR, resLR)=>{
+                // error handling
+                if(errLR) {
+                    reject(errLR);
+                    return;
+                }
+                // if no job in doing, return zero
+                if(resLR==null || (Array.isArray(resLR)==true && resLR.length==0)) {
+                    resolve(0);
+                    return;
+                }
+                // if no error, count jobs that match this task
+                let nb = 0;
+                for(let i=0;i<resLR.length;i++) {
+                    if(resLR[i].indexOf(task)!=-1)nb++;
+                }
+                resolve(nb);
+                return;
             });
         });
     }
@@ -196,7 +236,6 @@ class WorkerRole {
             let tfilename = taskid+"-transactions";
             // we use that boolean to avoid rejecting and then resolveing when pipes closed
             var rejectedWithError = false;
-            var processingDone = false;
 
             // this callback is to be called when everything has been processed
             let everythingFinishedCallback = ()=>{
@@ -204,7 +243,7 @@ class WorkerRole {
                 if(rejectedWithError == false)
                     resolve();
                 // clear the pipes files
-                exec("rm pipes/"+bfilename+".json pipes/"+tfilename+".json tmpfs/"+tfilename+"-partial.json", (errRM, stdoRM, stdeRM)=>{
+                exec("rm pipes/"+bfilename+".json pipes/"+tfilename+".json", (errRM, stdoRM, stdeRM)=>{
                     if(errRM) {
                         this._logErrors("ERROR(worker._streamBlocksAndTransactions): Unable to delete the pipe files:"+errRM);
                     }
@@ -287,12 +326,9 @@ class WorkerRole {
 
                                 // if everything is alright, we launch the command
                                 let command = "bitcoinetl export_blocks_and_transactions --start-block "+minblock+
-                                " --end-block "+maxblock+" -p http://"+process.env.CRYPTO_CLIENTS_LOGIN+
+                                " --end-block "+maxblock+" -w 1 -p http://"+process.env.CRYPTO_CLIENTS_LOGIN+
                                 ":"+process.env.CRYPTO_CLIENTS_PWD+"@"+resLMOV+" --chain bitcoin --blocks-output pipes/"+
-                                bfilename+".json --transactions-output tmpfs/"+tfilename+"-partial.json "+
-                                "&& bitcoinetl enrich_transactions -p http://"+process.env.CRYPTO_CLIENTS_LOGIN+
-                                ":"+process.env.CRYPTO_CLIENTS_PWD+"@"+resLMOV+" --chain bitcoin  --transactions-input tmpfs/"+
-                                tfilename+"-partial.json --transactions-output pipes/"+tfilename+".json";
+                                bfilename+".json --transactions-output pipes/"+tfilename+".json ";
 
                                 this._debug("Calling command: "+command);
                                 // spawn the child
@@ -340,14 +376,14 @@ class WorkerRole {
             let jobname = ""+keyspace+"::FILL_BLOCK_RANGE::"+this._identifier+"::"+minblock+","+maxblock;
             // wrap up call to reject and move job to error stack simultaneously
             let rejectAndMoveToErrorStack = (err)=>{
-                this._cassandraWriter.clearJobIfExists(jobname);
+                this._cassandraWriter.clearFillingJobIfExists(jobname);
                 this._logErrors(err);
                 this._moveJobToErrorStack(jobname).then(()=>{reject(err);}).catch(reject);
             };
             // push the job to the list of work in progress
             this._redisClient.lpush(""+this._currency+"::jobs::doing", jobname, (errLP, resLPL)=>{
                 if(errLP) {
-                    reject("REDIS ERROR (worker._startTestJob): Unable to push job to doing list: "+errLP);
+                    reject("REDIS ERROR (worker._startBlockRangeFillJob): Unable to push job to doing list: "+errLP);
                     return;
                 }
 
@@ -356,11 +392,19 @@ class WorkerRole {
                     // register job error watcher
                     try {
                         // this also register the callback for when all the write have been confirmed
-                        this._cassandraWriter.registerJob(jobname, ()=>{
-                            this._cassandraWriter.getJobStatus(jobname).then((err)=>{
+                        this._cassandraWriter.registerFillingJob(jobname, ()=>{
+                            this._cassandraWriter.getFillingJobStatus(jobname).then((err)=>{
                                 if(err==null) {
-                                    // the stream function will return when it's done
                                     this._moveJobFromDoingToDone(jobname).then(resolve).catch(reject);
+                                    // now let the master know this range is finished
+                                    // (it will test all finished ranges to generate tx enrichment (input inference) jobs)
+                                    this._redisClient.rpush(""+this._currency.toUpperCase()+"::filled-ranges::"+keyspace, 
+                                        ""+minblock+","+maxblock, (errLP, resLP)=>{
+                                            if(errLP) {
+                                                this._logErrors("(REDIS FATAL ERROR) Unable to push to redis filled block stack: "+errLP);
+                                                this._markKeyspaceAsBroken(keyspace);
+                                            }
+                                        });
                                 } else {
                                     rejectAndMoveToErrorStack(err);
                                 }
@@ -384,23 +428,50 @@ class WorkerRole {
     }
 
     // test job
-    _startTestJob(testname, id, total) {
+    _startEnrichJob(keyspace, minblock, maxblock) {
         return new Promise((resolve,reject)=>{
             // generate elem to push to in progress stack
-            let jobname = ""+testname+"::TEST_JOB::"+this._identifier+"::"+id+","+total;
+            let jobname = ""+keyspace+"::ENRICH_BLOCK_RANGE::"+this._identifier+"::"+minblock+","+maxblock;
+            // wrap up call to reject and move job to error stack simultaneously
+            let rejectAndMoveToErrorStack = (err)=>{
+                this._logErrors(err);
+                this._moveJobToErrorStack(jobname).then(()=>{reject(err);}).catch(reject);
+            };
             // push the job to the list of work in progress
             this._redisClient.lpush(""+this._currency+"::jobs::doing", jobname, (errLP, resLPL)=>{
                 if(errLP) {
-                    reject("REDIS ERROR (worker._startTestJob): Unable to push job to doing list: "+errLP);
+                    reject("REDIS ERROR (worker._startEnrichJob): Unable to push job to doing list: "+errLP);
                     return;
                 }
 
-                // now as it's just a test job we will move the task from one pile to another after random timeout
-                setTimeout(()=>{
-                    this._moveJobFromDoingToDone(jobname).then(resolve).catch(reject);
-                }, 10000*Math.random());
+                // prepare the keyspace if it's not
+                this._cassandraWriter.prepareForKeyspace(keyspace).then(()=>{
+                    // prepare for the job and allocate necessary objects
+                    this._cassandraWriter.registerEnrichingJob(jobname, (err)=>{
+                        if(err==null) {
+                            this._moveJobFromDoingToDone(jobname).then(resolve).catch(reject);
+                        } else {
+                            rejectAndMoveToErrorStack(err);
+                            return;
+                        }
+                    });
+                }).catch(rejectAndMoveToErrorStack);
             });
         });
+    }
+
+    _markKeyspaceAsBroken(keyspace) {
+        // if the redis instance is temporarly down and it made the tasks fail, waiting a bit might increase success rate
+        setTimeout(()=>{
+            this._redisClient.hset(this._currency.toUpperCase()+"::monitored::"+keyspace, "broken", "true", (errSet)=>{
+                if(errSet) {
+                    this._logErrors("Fatal redis error:"+ errSet);
+                    process.exit(1);
+                }
+                // notify users (all errors are also streamed to cli clients)
+                this._logErrors("Keyspace "+keyspace+" was marked as broken.");
+            });
+        },5000);
     }
 
     _moveJobFromDoingToDone(jobname) {
