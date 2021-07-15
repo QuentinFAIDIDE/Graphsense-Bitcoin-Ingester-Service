@@ -2,10 +2,12 @@ const redis = require("redis");
 var ExpressCassandra = require("express-cassandra");
 const fs = require("fs");
 const { exec } = require("child_process");
-const { type } = require("os");
+const cassandra = require("cassandra-driver");
 
 var MIN_CLIENT_INIT_TIME = 10000;
 var MAX_RETRY_CASSANDRA = 50;
+
+var push_transaction_query = "INSERT INTO transaction (tx_prefix, tx_hash, tx_index, height, timestamp, coinbase, total_input, total_output, inputs, outputs, coinjoin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
 var KEYSPACE_REGEXP = /^[a-z0-9_]{1,48}$/;
 
@@ -40,6 +42,7 @@ class CassandraWriter {
         this._debug = debug;
 
         // initalize the map where we will save the cassandra instances
+        this._expressCassandraDrivers = {};
         this._cassandraDrivers = {};
         this._transactionModels = {};
         this._summaryStatisticsModels = {};
@@ -62,6 +65,9 @@ class CassandraWriter {
             socketOptions: {
                 connectTimeout: 60000,
                 readTimeout: 120000
+            },
+            encoding: {
+                useBigIntAsLong: true
             }
         };
         this._ormOptions = {
@@ -156,7 +162,7 @@ class CassandraWriter {
             }
             try {
                 // test if we don't already have a client for this keyspace
-                if(typeof this._cassandraDrivers[keyspace] == "undefined") {
+                if(typeof this._expressCassandraDrivers[keyspace] == "undefined") {
                     // write the file with the schema definition
                     fs.writeFile("scripts/"+keyspace+".cql", 
                         String(this._cqlSchemaTemplate).replace(/\[MY_KEYSPACE_NAME\]/g, keyspace), (err)=>{
@@ -186,17 +192,19 @@ class CassandraWriter {
                                 let clientOptions =  this._clientOptions;
                                 clientOptions.keyspace = keyspace;
                                 // now it's time to start it
-                                this._cassandraDrivers[keyspace] = ExpressCassandra.createClient(
+                                this._expressCassandraDrivers[keyspace] = ExpressCassandra.createClient(
                                     {
                                         clientOptions: clientOptions,
                                         ormOptions: this._ormOptions
                                     });
+                                // create the vanilla driver client as well
+                                this._cassandraDrivers[keyspace] = new cassandra.Client(clientOptions);
                                 // create models
-                                this._transactionModels[keyspace] = this._cassandraDrivers[keyspace].loadSchema("transaction", this._transactionModel);
-                                this._blockModels[keyspace] = this._cassandraDrivers[keyspace].loadSchema("block", this._blockModel);
-                                this._blockTransactionsModels[keyspace] = this._cassandraDrivers[keyspace].loadSchema("block_transactions", this._blockTransactionsModel);
-                                this._summaryStatisticsModels[keyspace] = this._cassandraDrivers[keyspace].loadSchema("summary_statistics", this._summaryStatisticsModel);
-                                this._exchangeRatesModels[keyspace] = this._cassandraDrivers[keyspace].loadSchema("exchange_rates", this._exchangeRatesModel);
+                                this._transactionModels[keyspace] = this._expressCassandraDrivers[keyspace].loadSchema("transaction", this._transactionModel);
+                                this._blockModels[keyspace] = this._expressCassandraDrivers[keyspace].loadSchema("block", this._blockModel);
+                                this._blockTransactionsModels[keyspace] = this._expressCassandraDrivers[keyspace].loadSchema("block_transactions", this._blockTransactionsModel);
+                                this._summaryStatisticsModels[keyspace] = this._expressCassandraDrivers[keyspace].loadSchema("summary_statistics", this._summaryStatisticsModel);
+                                this._exchangeRatesModels[keyspace] = this._expressCassandraDrivers[keyspace].loadSchema("exchange_rates", this._exchangeRatesModel);
                                 // wait and start
                                 setTimeout(resolve, MIN_CLIENT_INIT_TIME-Math.abs(this._cassandraDriversTimestamps[keyspace]-Date.now()));
 
@@ -312,8 +320,6 @@ class CassandraWriter {
             let txToWrite = resMul[0].length;
             let txProcessed = 0;
 
-            console.log("Block "+(firstblock+i)+" has "+ txToWrite + " txs to process");
-
             // calback when a transaction is done
             // success parameter is not used here but is necessary for the _findTxInputs function
             let txDoneCallback = (success)=>{
@@ -358,13 +364,11 @@ class CassandraWriter {
     }
 
     _findTxInputs (keyspace, jobname, inputData, txDoneCallback, retry=false) {
-        console.log("Looking for input for tx: "+Buffer(inputData.h).toString("hex"));
         let txFound = 0;
         let txInputs = [];
         let failedCassandraRead = false;
         // input found callback
         let foundInputCallback = ()=>{
-            console.log("Found one tx");
             txFound++;
             // if we found all inputs
             if(txFound>=inputData.t.length) {
@@ -397,13 +401,9 @@ class CassandraWriter {
             }
         };
 
-        console.log("Inputdata:");
-        console.log(JSON.stringify(inputData));
-
         // for each input in the tx
         for(let j=0;j<inputData.t.length;j++) {
             // TODO OPTIMIZATION: try using redis cache here first
-            console.log("Making request for input "+j);
             // get corresponding UTXOs from cassandra
             this._transactionModels[keyspace].findOne({
                 tx_prefix: inputData.t[j][0].substring(0,5),
@@ -412,10 +412,8 @@ class CassandraWriter {
                 // if error, stop right away and push 
                 if(err) {
                     failedCassandraRead=true;
-                    console.log("ceeeeer");
                 } else {
                     // TODO: find out why request return null (failed write for filling ??)
-                    if(transac==null) console.log("Barbouze !");
                     // if no error, get the right output and set it as the input
                     txInputs[j] = transac.outputs[inputData.t[j][1]];
                 }
@@ -474,6 +472,11 @@ class CassandraWriter {
         // create request object to bulk writes
         let queries = [];
 
+        // abort if job is broken
+        if(this._jobErrors.hasOwnProperty(jobname)==false || this._jobErrors[jobname].length>0) {
+            return;
+        }
+
         // for each line
         for(let i=0;i<lines.length;i++) {
             // buffer to parse blocks
@@ -510,7 +513,7 @@ class CassandraWriter {
                         if(this._blockTransactionMaps[jobname][blockObj.number].writen_tx>=this._blockTransactionMaps[jobname][blockObj.number].total_tx) {
                             this._writeBlockTransactionSummary(keyspace, jobname, blockObj.number);
                         }
-                    } else { this._debug("A block was received with already set total_tx !") }
+                    } else { this._debug("A block was received with already set total_tx !"); }
                 } else {
                     // create the map to store transactions infos in their blocks
                     this._blockTransactionMaps[jobname][blockObj.number] = {
@@ -535,13 +538,17 @@ class CassandraWriter {
         }
 
         // send the writes
-        this._cassandraDrivers[keyspace].doBatch(queries, (err)=>{
+        this._expressCassandraDrivers[keyspace].doBatch(queries, (err)=>{
             if(err)this._manageCassandraErrorsForJob(jobname, err, queries, "block");
         });
     }
 
     // function to format data for the block_transactions table
     _addTransactionToBlockSummary(keyspace, jobname, height, hash, nin, nout, tin, tout) {
+        // abort if job is aborted
+        if(this._jobErrors.hasOwnProperty(jobname)==false) {
+            return;
+        }
         // if the block is in the map
         if(this._blockTransactionMaps[jobname].hasOwnProperty(height)==true) {
             // push the new tx summary
@@ -675,15 +682,35 @@ class CassandraWriter {
         // parse lines
         let lines = String(txbuffer).split("\n");
 
+        // abort if job is broken
+        if(this._jobErrors.hasOwnProperty(jobname)==false || this._jobErrors[jobname].length>0) {
+            return;
+        }
 
         // callbacks to send the writes once UTXO have been set/get in cache
 
         let callbackWrite = ()=>{
+            // abort if job is broken
+            if(this._jobErrors.hasOwnProperty(jobname)==false || this._jobErrors[jobname].length>0) {
+                return;
+            }
             // send the writes
-            this._cassandraDrivers[keyspace].doBatch(queries, (err)=>{
-                if(err)this._manageCassandraErrorsForJob(jobname, err, queries, "transaction");
+            this._cassandraDrivers[keyspace].batch(queries, {prepare:true}).then(()=>{
                 // failure or not, we need to know when all tx have been received to start recovering
                 // hence the count and test
+                this._jobTxCount[jobname].txReceived+=queries.length;
+                if(this._jobTxCount[jobname].txReceived>=this._jobTxCount[jobname].txToWrite) {
+                    // if all blocks have been received and filled with txs
+                    if(this._jobTxCount[jobname].blocks_finished==true) {
+                        // if all block_transaction rows were written
+                        if(this._writtenBlocksPerJob[jobname]>=this._totalBlocksPerJob[jobname]) {
+                            // start the process of recovering eventual write errors and terminating job
+                            this._recoverFillJobErrors(keyspace, jobname);
+                        }
+                    }
+                }
+            }).catch((err)=>{
+                this._manageCassandraErrorsForJob(jobname, err, queries, "transaction");
                 this._jobTxCount[jobname].txReceived+=queries.length;
                 if(this._jobTxCount[jobname].txReceived>=this._jobTxCount[jobname].txToWrite) {
                     // if all blocks have been received and filled with txs
@@ -716,12 +743,12 @@ class CassandraWriter {
                     row = {
                         tx_prefix: jsonObj.hash.substring(0,5),
                         tx_hash: Buffer.from(jsonObj.hash,"hex"),
-                        tx_index: ExpressCassandra.datatypes.Long.fromString(this._generateTxIndex(jobname, jsonObj.block_number),10),
+                        tx_index: String(this._generateTxIndex(jobname, jsonObj.block_number)),
                         height: jsonObj.block_number,
                         timestamp: jsonObj.block_timestamp,
                         coinbase: jsonObj.is_coinbase,
-                        total_input: ExpressCassandra.datatypes.Long.fromInt(jsonObj.input_value),
-                        total_output: ExpressCassandra.datatypes.Long.fromInt(jsonObj.output_value),
+                        total_input: String(jsonObj.input_value),
+                        total_output: String(jsonObj.output_value),
                         inputs: this._inputConvertETLtoGraphSense(jsonObj.inputs),
                         outputs: this._inputConvertETLtoGraphSense(jsonObj.outputs),
                         coinjoin: false
@@ -731,6 +758,11 @@ class CassandraWriter {
 
                     // try to see if input required are already in redis RAM cache, and push outputs in there
                     this._getSetTxIO(row.coinbase ,row.tx_hash, jsonObj.inputs, row.outputs).then((txIOresponse)=>{
+
+                        // abort if job is aborted
+                        if(this._jobErrors.hasOwnProperty(jobname)==false  || this._jobErrors[jobname].length>0) {
+                            return;
+                        }
 
                         txWriten++;
 
@@ -762,13 +794,16 @@ class CassandraWriter {
                             row.coinjoin = false;
                         }
 
-                        // save the tx summary to our maps
+                        // save the tx summary to our maps (also increase writtenTx)
                         this._addTransactionToBlockSummary(keyspace, jobname, row.height, row.tx_hash,
                             row.inputs.length, row.outputs.length, row.total_input,
                             row.total_output);
 
-                        // initalize cassandra row and prepare it to be sent with others
-                        queries.push( new this._transactionModels[keyspace](row).save({return_query: true}));
+                        // initalize request row and prepare it to be sent with others
+                        queries.push({
+                            query: push_transaction_query,
+                            params: [row.tx_prefix, row.tx_hash, row.tx_index, row.height, row.timestamp, row.coinbase, row.total_input, row.total_output, row.inputs, row.outputs, row.coinjoin]
+                        });
 
                         // if the transaction was a garbage collection, clean the garbage
                         if(garbageCollection==true) {
@@ -962,7 +997,7 @@ class CassandraWriter {
             }).save({return_query: true}));
         }
         // send all the block transac
-        this._cassandraDrivers[keyspace].doBatch(blockTransacQueries, (err)=>{
+        this._expressCassandraDrivers[keyspace].doBatch(blockTransacQueries, (err)=>{
             if(err) {
                 this._logErrors(err);
                 recoveredCallback(false);
@@ -980,7 +1015,7 @@ class CassandraWriter {
             blockQueries.push(new this._blockModels[keyspace](row).save({return_query: true}));
         }
         // send all the block transac
-        this._cassandraDrivers[keyspace].doBatch(blockQueries, (err)=>{
+        this._expressCassandraDrivers[keyspace].doBatch(blockQueries, (err)=>{
             if(err) {
                 this._logErrors(err);
                 recoveredCallback(false);
@@ -995,16 +1030,14 @@ class CassandraWriter {
             // used to bulk calls
             let row = this._jobCassandraIORetryStack[jobname]["transaction"][i];
             // push it to the list of calls to make
-            txQueries.push(new this._transactionModels[keyspace](row).save({return_query: true}));
+            txQueries.push(row);
         }
         // send all the block transac
-        this._cassandraDrivers[keyspace].doBatch(txQueries, (err)=>{
-            if(err) {
-                this._logErrors(err);
-                recoveredCallback(false);
-            } else {
-                recoveredCallback(true);
-            }
+        this._cassandraDrivers[keyspace].batch(txQueries, {prepare: true}).then(()=>{
+            recoveredCallback(true);
+        }).catch((err)=>{
+            this._logErrors(err);
+            recoveredCallback(false);
         });
     }
 
@@ -1023,9 +1056,11 @@ class CassandraWriter {
             if(address_types.hasOwnProperty(etlObj[i].type)==true) {
                 adtypeid = address_types[etlObj[i].type];
             }
+            let value = "0";
+            if(etlObj[i].value!=null)value=String(etlObj[i].value);
             graphsenseObj.push({
                 address: etlObj[i].addresses,
-                value: etlObj[i].value,
+                value: value,
                 address_type: adtypeid
             });
         }
@@ -1152,7 +1187,7 @@ class CassandraWriter {
             }
 
             // execute the bulk write
-            this._cassandraDrivers[keyspace].doBatch(queries, (err)=>{
+            this._expressCassandraDrivers[keyspace].doBatch(queries, (err)=>{
                 if(err) {
                     this._logErrors(err);
                     reject(err);

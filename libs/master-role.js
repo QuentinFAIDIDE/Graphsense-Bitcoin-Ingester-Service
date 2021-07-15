@@ -10,6 +10,8 @@ var MIN_RATE_DATE = "2010-10-17";
 
 var MAX_TODO_STACK_LEN = 15;
 
+var RATE_WRITING_LOCK_TIMEOUT = 60000*10;
+
 class MasterRole {
     /*
     Class that implements master role
@@ -50,6 +52,8 @@ class MasterRole {
         });
 
         this._workersIds = [];
+
+        this._rateWritingLocks = {};
 
         this._cassandraWriter = new CassandraWriter(redisHost,redisPort, symbol, logMessage, logErrors, debug);
     }
@@ -194,12 +198,28 @@ class MasterRole {
                                         // update the last queued block for the keyspace
                                         mult.hset(this._currency.toUpperCase()+"::monitored::"+keyspaces[i].name, "lastQueuedBlock", furthest_block_sent);
                                     }
+                                    // detect lock to prevent rate writing race conditions 
+                                    let ratesWriting = false;
+                                    if(this._rateWritingLocks.hasOwnProperty(keyspaces[i].name)==true) {
+                                        // if lock is expired
+                                        if((Date.now()-this._rateWritingLocks[keyspaces[i].name])>RATE_WRITING_LOCK_TIMEOUT) {
+                                            // ignore the lock and delete it
+                                            delete this._rateWritingLocks[keyspaces[i].name];
+                                        // if lock is still valid, set bool as true
+                                        } else {
+                                            ratesWriting = true;
+                                        }
+                                    }
+                                    // if the lock is set for the keyspace
+                                    if(ratesWriting==true) {
+                                        // return and ignore the rate writing part
+                                        processingDoneCallback();
+                                        return;
+                                    }
                                     // if rates were not set
                                     if(keyspaces[i].hasOwnProperty("lastRatesWritten")==false) {
                                         // get yesterdays date in YYYY-MM-DD format
                                         let yestedayTxt = this._getYesterdayDateTxt();
-                                        // make the mult update the date before entering promise-waiting a state
-                                        mult.hset(this._currency.toUpperCase()+"::monitored::"+keyspaces[i].name, "lastRatesWritten", yestedayTxt);
                                         // call the function to update all rates in this namespace
                                         this._updateRatesForKeyspaceForRange(keyspaces[i].name, null, yestedayTxt);
                                     // else, check if some might be missing
@@ -210,14 +230,12 @@ class MasterRole {
                                         let lastRatesWritten = keyspaces[i].lastRatesWritten;
                                         // if some days are missing
                                         if(yestedayTxt!=lastRatesWritten) {
-                                            // make the mult update the last date written
-                                            //   before entering a promise waiting state
-                                            mult.hset(this._currency.toUpperCase()+"::monitored::"+keyspaces[i].name, "lastRatesWritten", yestedayTxt);
                                             // call the function to update rates in this namespace
                                             this._updateRatesForKeyspaceForRange(keyspaces[i].name, lastRatesWritten, yestedayTxt);
                                         }
                                     }
                                     processingDoneCallback();
+                                    return;
                                 });
                             }
                         }
@@ -257,19 +275,50 @@ class MasterRole {
         if(from==null) {
             from = MIN_RATE_DATE;
         }
+        // set the rate update lock
+        this._rateWritingLocks[keyspace] = Date.now();
+        // debug logs...
         this._debug("Updating rates from "+from+" to "+to);
         // prepare the keyspace
         this._cassandraWriter.prepareForKeyspace(keyspace).then(()=>{
             // once its ready, get the btc rates
             this._getRatesFromCoindesk("EUR" ,from, to).then((eur_rates)=>{
                 this._getRatesFromCoindesk("USD" ,from, to).then((usd_rates)=>{
+                    // used to keep track of async operations
+                    let toWrite=0;
+                    let success=0;
+                    let failures=0;
                     // for each rate received, push it in cassandra
                     Object.keys(usd_rates).forEach((key)=>{
+                        toWrite++;
                         this._cassandraWriter.writeExchangeRates(keyspace, [{
                             date: key,
                             eur: eur_rates[key],
                             usd: usd_rates[key]
-                        }]).catch(this._logErrors);
+                        }]).then(()=>{
+                            // monitor succesfull writes
+                            success++;
+                            // if done
+                            if((success)>=toWrite) {
+                                // we are done and will write the lastRatesWritten
+                                this._redisClient.hset(this._currency.toUpperCase()+"::monitored::"+keyspace, "lastRatesWritten", to);
+                                // liberate the lock
+                                delete this._rateWritingLocks[keyspace];
+                            // if done with errors
+                            } else if((success+failures)>=toWrite) {
+                                // liberate the lock
+                                delete this._rateWritingLocks[keyspace];
+                            }
+                        }).catch((err)=>{
+                            failures++;
+                            // monitor failed writes
+                            this._logErrors(err);
+                            // if done
+                            if((success+failures)>=toWrite) {
+                                // liberate the lock
+                                delete this._rateWritingLocks[keyspace];
+                            }
+                        });
                     });
                 }).catch(this._logErrors);
             }).catch(this._logErrors);
