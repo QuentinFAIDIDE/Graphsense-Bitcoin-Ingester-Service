@@ -1,3 +1,6 @@
+// keeps buggy eslint from throwing errors (unable to set es2020 for whatever reason)
+/* global BigInt */
+
 const redis = require("redis");
 var ExpressCassandra = require("express-cassandra");
 const fs = require("fs");
