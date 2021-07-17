@@ -78,7 +78,13 @@ var logErrors = function (err) {
         console.log(msg);
     }
     // forward the error to cli clients
-    redisClient.publish(""+CURRENCY_SYMBOL.toUpperCase()+"::errors", msg);
+    redisClient.publish(""+CURRENCY_SYMBOL.toUpperCase()+"::errors", msg, ()=>{
+        // let's abort if cassandra is unreachable
+        if(msg.indexOf("All host(s) tried for query failed. First host tried")!=-1) {
+            console.error("Fatal error: cassandra unreachable.");
+            process.exit(1);
+        }
+    });
 };
 
 // create master and worker managers

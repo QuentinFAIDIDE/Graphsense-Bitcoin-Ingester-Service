@@ -8,6 +8,7 @@ var MIN_CLIENT_INIT_TIME = 10000;
 var MAX_RETRY_CASSANDRA = 50;
 
 var push_transaction_query = "INSERT INTO transaction (tx_prefix, tx_hash, tx_index, height, timestamp, coinbase, total_input, total_output, inputs, outputs, coinjoin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+var update_tx_inputs_query = "UPDATE transaction SET total_input=?, inputs=?, coinjoin=? WHERE tx_prefix=? AND tx_hash=?";
 
 var KEYSPACE_REGEXP = /^[a-z0-9_]{1,48}$/;
 
@@ -379,24 +380,27 @@ class CassandraWriter {
                     // increase tx count
                     txDoneCallback(false);
                 } else {
+                    let total_input = BigInt(0);
+                    // compute total input value
+                    for(let i=0;i<txInputs.length;i++) {
+                        total_input += txInputs[i].value;
+                    }
                     // now, run the coinjoin algorithm on the in/outs
                     let coinjoin = this._detectCoinjoin({inputs: txInputs, outputs: inputData.o});
                     // and finally write the transaction
-                    this._transactionModels[keyspace].update({
-                        tx_prefix: Buffer(inputData.h).toString("hex").substring(0,5),
-                        tx_hash: Buffer(inputData.h)
-                    }, {
-                        inputs: txInputs,
-                        coinjoin: coinjoin
-                    }, function (err) {
-                        if(err) {
-                            if(retry==false)this._manageCassandraErrorsForJob(jobname, new Error("Cassandra: Unable to get inputs for tx"), 
-                                {tx_hash: inputData.h ,inputs:txInputs, coinjoin:coinjoin}, "input-write");
-                            // volontalery left no return here to keep on counting this tx as done (we'll retry at the end if error rate is low enought)
-                        }
-                        // increase tx count
-                        txDoneCallback(true);
-                    });
+                    // "UPDATE transaction SET total_input=?, inputs=?, coinjoin=? WHERE tx_prefix=? AND tx_hash=?"
+                    let params = [ total_input, txInputs, coinjoin, Buffer(inputData.h).toString("hex").substring(0,5), Buffer(inputData.h)];
+                    this._cassandraDrivers[keyspace].execute(update_tx_inputs_query, params, { prepare: true })
+                        .then(()=>{
+                            // resolve call
+                            txDoneCallback(true);
+                        }).catch((err)=>{
+                            if(retry==false) {
+                                this._manageCassandraErrorsForJob(jobname, err, params, "input-write");
+                            }
+                            // resolve call and tell about failure
+                            txDoneCallback(false);
+                        });
                 }
             }
         };
@@ -626,26 +630,23 @@ class CassandraWriter {
     }
 
     _manageCassandraErrorsForJob(jobname, err, rows=null, table=null) {
-        // in case of error, save it for the worker service to retrieev it later
-        if(err) {
-            this._logErrors("Cassandra error at write:"+err);
-            // if the write was a pending one that hadn't been finished before another failure that cleared job memory
-            if(typeof this._jobErrors[jobname] == "undefined") {
-                this._debug("Job "+jobname+" received a cassandra error after its termination.");
-                return;
-            }
-            //if the job is still running save the error if we didn't saved too much already
-            if(this._jobCassandraIORetryStack[jobname].count<MAX_RETRY_CASSANDRA) {
-                if(rows!=null) {
-                    for(let i=0;i<rows.length;i++) {
-                        this._jobCassandraIORetryStack[jobname][table].push(rows[i]);
-                        this._jobCassandraIORetryStack[jobname].count++;
-                    }
+        this._logErrors("Cassandra error at write:"+err);
+        // if the write was a pending one that hadn't been finished before another failure that cleared job memory
+        if(typeof this._jobErrors[jobname] == "undefined") {
+            this._debug("Job "+jobname+" received a cassandra error after its termination.");
+            return;
+        }
+        //if the job is still running save the error if we didn't saved too much already
+        if(this._jobCassandraIORetryStack[jobname].count<MAX_RETRY_CASSANDRA) {
+            if(rows!=null) {
+                for(let i=0;i<rows.length;i++) {
+                    this._jobCassandraIORetryStack[jobname][table].push(rows[i]);
+                    this._jobCassandraIORetryStack[jobname].count++;
                 }
-            // if the job has reached maximum allowed write errors, push an error to the stack
-            } else {
-                this._jobErrors[jobname].push("FATAL ERROR: cassandra error rate is too high, error recovery stack max size has been reached.");
             }
+        // if the job has reached maximum allowed write errors, push an error to the stack
+        } else {
+            this._jobErrors[jobname].push("FATAL ERROR: cassandra error rate is too high, error recovery stack max size has been reached.");
         }
     }
 
@@ -929,21 +930,16 @@ class CassandraWriter {
 
         // try to recover tx writes
         for(let i=0;i<this._jobCassandraIORetryStack[jobname]["input-write"].length;i++) {
-
+            // get the query saved at previous failure
             let row = this._jobCassandraIORetryStack[jobname]["input-write"][i];
-
-            // send all the block transac
-            this._transactionModels[keyspace].update({
-                tx_prefix: row.tx_hash.toString("hex").substring(0,5),
-                tx_hash: row.tx_hash
-            }, {inputs: row.inputs, coinjoin: row.coinjoin}, (err)=>{
-                if(err) {
+            // update the row
+            this._cassandraDrivers[keyspace].execute(update_tx_inputs_query, row, {prepare: true})
+                .then(()=>{
+                    recoveredCallback(true);
+                }).catch((err)=>{
                     this._logErrors(err);
                     recoveredCallback(false);
-                } else {
-                    recoveredCallback(true);
-                }
-            });
+                });
         }
     }
 
