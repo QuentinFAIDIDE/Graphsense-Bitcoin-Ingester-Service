@@ -161,82 +161,85 @@ class MasterRole {
                                 // first, check if keyspace has filled block range further enough to pop new enrich jobs (requires to have all previous utxo)
                                 this._updateLastFilledBlockAndPopEnrichJobs(keyspaces[i]).then(()=>{
 
-                                    // if last block availabl minus confirm delay is bigger than last keyspace block
-                                    if(Number(keyspaces[i].lastQueuedBlock) < Number(maxheight) - Number(keyspaces[i].delay)) {
-                                        // push a job for the new block
-                                        let range = [Number(keyspaces[i].lastQueuedBlock)+1 ,Number(maxheight) - Number(keyspaces[i].delay)];
-                                        
-                                        let jobname = keyspaces[i].name+"::FILL_BLOCK_RANGE::"+range[0]+","+range[1];
+                                    this._updateLastEnrichedBlockAndStatistics(keyspaces[i]).then(()=>{
 
-                                        let tasksPending = todoStackLength;
-                                
-                                        // split job into subtask of blck size
-                                        let furthest_block_sent = Number(range[0]-1);
-                                        let end = Number(range[1]);
-                                        let split_size = BLOCK_BATCH_SIZE;
-                                        while ((furthest_block_sent + split_size) <= end && tasksPending<MAX_TODO_STACK_LEN) {
-                                            tasksPending++;
-                                            // sending job for subrange
-                                            jobname = keyspaces[i].name+"::FILL_BLOCK_RANGE::"+
-                                                (furthest_block_sent+1)+","+String(furthest_block_sent + split_size);
-                                            // push the job in the redis bulk call objects
-                                            mult.rpush(this._currency.toUpperCase()+"::jobs::todo", jobname);
-                                            // increment to next batch
-                                            furthest_block_sent += split_size;
+                                        // if last block availabl minus confirm delay is bigger than last keyspace block
+                                        if(Number(keyspaces[i].lastQueuedBlock) < Number(maxheight) - Number(keyspaces[i].delay)) {
+                                            // push a job for the new block
+                                            let range = [Number(keyspaces[i].lastQueuedBlock)+1 ,Number(maxheight) - Number(keyspaces[i].delay)];
+                                            
+                                            let jobname = keyspaces[i].name+"::FILL_BLOCK_RANGE::"+range[0]+","+range[1];
+
+                                            let tasksPending = todoStackLength;
+                                    
+                                            // split job into subtask of blck size
+                                            let furthest_block_sent = Number(range[0]-1);
+                                            let end = Number(range[1]);
+                                            let split_size = BLOCK_BATCH_SIZE;
+                                            while ((furthest_block_sent + split_size) <= end && tasksPending<MAX_TODO_STACK_LEN) {
+                                                tasksPending++;
+                                                // sending job for subrange
+                                                jobname = keyspaces[i].name+"::FILL_BLOCK_RANGE::"+
+                                                    (furthest_block_sent+1)+","+String(furthest_block_sent + split_size);
+                                                // push the job in the redis bulk call objects
+                                                mult.rpush(this._currency.toUpperCase()+"::jobs::todo", jobname);
+                                                // increment to next batch
+                                                furthest_block_sent += split_size;
+                                            }
+
+                                            // if there is a remainder, send it as well
+                                            if (furthest_block_sent < end && tasksPending<MAX_TODO_STACK_LEN) {
+                                                // sending job for subrange
+                                                jobname = keyspaces[i].name+"::FILL_BLOCK_RANGE::"+
+                                                    (furthest_block_sent+1)+","+(end);
+                                                furthest_block_sent = end;
+                                                // push the job in the redis bulk call objects
+                                                mult.rpush(this._currency.toUpperCase()+"::jobs::todo", jobname);
+                                            }
+
+                                            // update the last queued block for the keyspace
+                                            mult.hset(this._currency.toUpperCase()+"::monitored::"+keyspaces[i].name, "lastQueuedBlock", furthest_block_sent);
                                         }
-
-                                        // if there is a remainder, send it as well
-                                        if (furthest_block_sent < end && tasksPending<MAX_TODO_STACK_LEN) {
-                                            // sending job for subrange
-                                            jobname = keyspaces[i].name+"::FILL_BLOCK_RANGE::"+
-                                                (furthest_block_sent+1)+","+(end);
-                                            furthest_block_sent = end;
-                                            // push the job in the redis bulk call objects
-                                            mult.rpush(this._currency.toUpperCase()+"::jobs::todo", jobname);
+                                        // detect lock to prevent rate writing race conditions 
+                                        let ratesWriting = false;
+                                        if(this._rateWritingLocks.hasOwnProperty(keyspaces[i].name)==true) {
+                                            // if lock is expired
+                                            if((Date.now()-this._rateWritingLocks[keyspaces[i].name])>RATE_WRITING_LOCK_TIMEOUT) {
+                                                // ignore the lock and delete it
+                                                delete this._rateWritingLocks[keyspaces[i].name];
+                                            // if lock is still valid, set bool as true
+                                            } else {
+                                                ratesWriting = true;
+                                            }
                                         }
-
-                                        // update the last queued block for the keyspace
-                                        mult.hset(this._currency.toUpperCase()+"::monitored::"+keyspaces[i].name, "lastQueuedBlock", furthest_block_sent);
-                                    }
-                                    // detect lock to prevent rate writing race conditions 
-                                    let ratesWriting = false;
-                                    if(this._rateWritingLocks.hasOwnProperty(keyspaces[i].name)==true) {
-                                        // if lock is expired
-                                        if((Date.now()-this._rateWritingLocks[keyspaces[i].name])>RATE_WRITING_LOCK_TIMEOUT) {
-                                            // ignore the lock and delete it
-                                            delete this._rateWritingLocks[keyspaces[i].name];
-                                        // if lock is still valid, set bool as true
+                                        // if the lock is set for the keyspace
+                                        if(ratesWriting==true) {
+                                            // return and ignore the rate writing part
+                                            processingDoneCallback();
+                                            return;
+                                        }
+                                        // if rates were not set
+                                        if(keyspaces[i].hasOwnProperty("lastRatesWritten")==false) {
+                                            // get yesterdays date in YYYY-MM-DD format
+                                            let yestedayTxt = this._getYesterdayDateTxt();
+                                            // call the function to update all rates in this namespace
+                                            this._updateRatesForKeyspaceForRange(keyspaces[i].name, null, yestedayTxt);
+                                        // else, check if some might be missing
                                         } else {
-                                            ratesWriting = true;
+                                            // get today's date minus one day
+                                            let yestedayTxt = this._getYesterdayDateTxt();
+                                            // get last rates written dates
+                                            let lastRatesWritten = keyspaces[i].lastRatesWritten;
+                                            // if some days are missing
+                                            if(yestedayTxt!=lastRatesWritten) {
+                                                // call the function to update rates in this namespace
+                                                this._updateRatesForKeyspaceForRange(keyspaces[i].name, lastRatesWritten, yestedayTxt);
+                                            }
                                         }
-                                    }
-                                    // if the lock is set for the keyspace
-                                    if(ratesWriting==true) {
-                                        // return and ignore the rate writing part
                                         processingDoneCallback();
                                         return;
-                                    }
-                                    // if rates were not set
-                                    if(keyspaces[i].hasOwnProperty("lastRatesWritten")==false) {
-                                        // get yesterdays date in YYYY-MM-DD format
-                                        let yestedayTxt = this._getYesterdayDateTxt();
-                                        // call the function to update all rates in this namespace
-                                        this._updateRatesForKeyspaceForRange(keyspaces[i].name, null, yestedayTxt);
-                                    // else, check if some might be missing
-                                    } else {
-                                        // get today's date minus one day
-                                        let yestedayTxt = this._getYesterdayDateTxt();
-                                        // get last rates written dates
-                                        let lastRatesWritten = keyspaces[i].lastRatesWritten;
-                                        // if some days are missing
-                                        if(yestedayTxt!=lastRatesWritten) {
-                                            // call the function to update rates in this namespace
-                                            this._updateRatesForKeyspaceForRange(keyspaces[i].name, lastRatesWritten, yestedayTxt);
-                                        }
-                                    }
-                                    processingDoneCallback();
-                                    return;
-                                });
+                                    }).catch(this._logErrors);
+                                }).catch(this._logErrors);
                             }
                         }
 
@@ -462,6 +465,124 @@ class MasterRole {
                         return;
                     }
                     resolve();
+                });
+            });
+        });
+    }
+
+    // function that pull enriched ranges list to update the last enriched block and write the keyspace statistics
+    _updateLastEnrichedBlockAndStatistics(keyspaceobj) {
+        return new Promise((resolve,reject)=>{
+
+            // pull 600 leftmost (eg oldest) ranges enriched to check furthest block below which everything is filled
+            this._redisClient.lrange(""+this._currency.toUpperCase()+"::"+keyspaceobj.name+"::enriched-ranges", 0, 600, (errLR, resLR)=>{
+                // error handling
+                if(errLR) {
+                    reject(errLR);
+                    return;
+                }
+                // if no new range was filled, abort
+                if(resLR==null || (Array.isArray(resLR)==true && resLR.length==0)) {
+                    resolve();
+                    return;
+                }
+                // parse ranges
+                let ranges = [];
+                for(let i=0;i<resLR.length;i++) {
+                    let splittedString = resLR[i].split(",");
+                    ranges.push([Number(splittedString[0]), Number(splittedString[1])]);
+                }
+                // sort em by range beginning order 
+                ranges.sort((a,b)=>{
+                    if(a[0]<=b[0])return -1;
+                    else return 1;
+                });
+
+                // increment over each job to increment the last block where all previous are enriched
+                let lastEnrichedBlock = -1;
+                if(keyspaceobj.hasOwnProperty("lastEnrichedBlock")==true) {
+                    lastEnrichedBlock = Number(keyspaceobj.lastEnrichedBlock);
+                }
+                let allBlocksBeforeAreEnriched = true;
+                let enrichJobFinishedIterator = 0;
+                while(allBlocksBeforeAreEnriched==true && enrichJobFinishedIterator<ranges.length) {
+                    // if the next range is available without a gap
+                    if(ranges[enrichJobFinishedIterator][0]==(lastEnrichedBlock+1)) {
+                        // change lastEnrichedBlock and iterate over next one
+                        lastEnrichedBlock=ranges[enrichJobFinishedIterator][1];
+                        enrichJobFinishedIterator++;
+                    // if not, break out of the loop since we have a gap
+                    } else {
+                        allBlocksBeforeAreEnriched=false;
+                    }
+                }
+
+
+
+                // if nothing changed, return 
+                if(enrichJobFinishedIterator==0) {
+                    resolve();
+                    return;
+                }
+
+                // if we have updated our lastEnrichedBlock, we will add all the tx an block counts with redis INCR
+                // this mult will first get the tx counts per job
+                let multi = this._redisClient.multi();
+                let jobname = "";
+                
+                for(let i=0;i<enrichJobFinishedIterator;i++) {
+                    // get tx counts for job
+                    multi.get(""+this._currency.toUpperCase()+"::job_stats::"+ keyspaceobj.name+"::"+ranges[i][0]+","+ranges[i][1]);
+                }
+
+                multi.exec((errMUL1, resMUL1)=>{
+                    // error handling (abort operations on redis errors)
+                    if(errMUL1) {
+                        reject(errMUL1);
+                        return;
+                    }
+                    // create a new multi
+                    let multIncr = this._redisClient.multi();
+                    // for each txCount we got for all jobs
+                    for(let i=0;i<resMUL1.length;i++) {
+                        // just in case a tx count was missing for a job
+                        if(resMUL1[i]==null) {
+                            // TODO: mark keyspace as broken in case this error happens one day
+                            reject(new Error("Tx count was missing for a job, can't write job statistics !"));
+                            return;
+                        }
+                        // if it's there, increment block number
+                        multIncr.incrby(this._currency.toUpperCase()+"::"+keyspaceobj.name+"::block-count", ranges[i][1]+1-ranges[i][0]);
+                        // also increment tx count
+                        multIncr.incrby(this._currency.toUpperCase()+"::"+keyspaceobj.name+"::tx-count", resMUL1[i]);
+                        // finally, remove the range from the enriched job list
+                        multIncr.lrem(""+this._currency.toUpperCase()+"::"+keyspaceobj.name+"::enriched-ranges", 1, ""+ranges[i][0]+","+ranges[i][1]);
+                    }
+
+                    // also, write the hash for last enriched block
+                    multIncr.hset(this._currency.toUpperCase()+"::monitored::"+keyspaceobj.name, "lastEnrichedBlock", lastEnrichedBlock);
+
+                    // only after we can get our total block and tx counts
+                    multIncr.get(this._currency.toUpperCase()+"::"+keyspaceobj.name+"::block-count");
+                    multIncr.get(this._currency.toUpperCase()+"::"+keyspaceobj.name+"::tx-count");
+
+                    
+                    // execute it
+                    multIncr.exec((errMUL2, resMUL2)=>{
+                        if(errMUL2) {
+                            this._logErrors("Failure when trying to update keyspace statistics.");
+                            reject(errMUL2);
+                            return;
+                        }
+                        // let's get the count in the response object (last two ones)
+                        let block_count = resMUL2[resMUL2.length-2];
+                        let tx_count = resMUL2[resMUL2.length-1];
+                        // now make the calls to the cassandraWriter class to write the statistics
+                        this._cassandraWriter.writeKeyspaceStatistics(keyspaceobj.name, block_count, tx_count);
+                        // do not wait for cassandra writes, just return at this point
+                        resolve();
+                        return;
+                    });
                 });
             });
         });

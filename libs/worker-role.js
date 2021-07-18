@@ -449,7 +449,20 @@ class WorkerRole {
                     // prepare for the job and allocate necessary objects
                     this._cassandraWriter.registerEnrichingJob(jobname, (err)=>{
                         if(err==null) {
-                            this._moveJobFromDoingToDone(jobname).then(resolve).catch(reject);
+                            // save the job range as done for master to increment keyspace statistics
+                            this._redisClient.rpush(""+this._currency.toUpperCase()+"::"+keyspace+"::enriched-ranges", ""+minblock+","+maxblock,
+                                (errLP2, resLP2)=>{
+                                    if(errLP2) {
+                                    // redis rpush error
+                                        this._logErrors("Failed to write enriched range to redis for master to update statistics");
+                                        rejectAndMoveToErrorStack(err);
+                                        return;
+                                    } else {
+                                    // all good, we can move the job in the done stack
+                                        this._moveJobFromDoingToDone(jobname).then(resolve).catch(reject);
+                                        return;
+                                    }
+                                });
                         } else {
                             rejectAndMoveToErrorStack(err);
                             return;

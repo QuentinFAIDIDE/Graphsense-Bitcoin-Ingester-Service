@@ -12,6 +12,7 @@ var MAX_RETRY_CASSANDRA = 50;
 
 var push_transaction_query = "INSERT INTO transaction (tx_prefix, tx_hash, tx_index, height, timestamp, coinbase, total_input, total_output, inputs, outputs, coinjoin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 var update_tx_inputs_query = "UPDATE transaction SET total_input=?, inputs=?, coinjoin=? WHERE tx_prefix=? AND tx_hash=?";
+var write_stats_query = "INSERT INTO summary_statistics (id, no_blocks, no_txs, timestamp) VALUES (?, ?, ?, ?)";
 
 var KEYSPACE_REGEXP = /^[a-z0-9_]{1,48}$/;
 
@@ -626,6 +627,10 @@ class CassandraWriter {
     }
 
     _clearAndTerminate(jobname) {
+        // push total number of tx and blocks in redis for later incr after enrich
+        // TODO: error handling with marking job as broken if job data already got cleared and on redis errors?
+        this._redisClient.set(""+this._currency.toUpperCase()+"::job_stats::"
+          + jobname.split("::")[0]+"::"+jobname.split("::")[3], this._jobTxCount[jobname].txToWrite);
         // call the callback for when everything's done
         this._jobDoneCallbacks[jobname]();
         // stream updates to cli clients
@@ -1197,6 +1202,21 @@ class CassandraWriter {
         });
     }
 
+    writeKeyspaceStatistics(keyspace, block_count, tx_count) {
+        this.prepareForKeyspace(keyspace).then(()=>{
+            this._cassandraDrivers[keyspace].execute(write_stats_query, 
+                [keyspace, Number(block_count), BigInt(tx_count), Date.now()/1000],
+                {prepare: true})
+                .catch((err)=>{
+                    // this error should be recoved at next try
+                    this._logErrors("Cassandra error while trying to write statistics");
+                    this._logErrors(err);
+                });
+        }).catch((err)=>{
+            this._logErrors("Unable to get keyspace ready to write keyspace stats");
+            this._logErrors(err);
+        });
+    }
 }
 
 
