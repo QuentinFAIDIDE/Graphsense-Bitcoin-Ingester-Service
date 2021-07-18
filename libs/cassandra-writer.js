@@ -765,68 +765,58 @@ class CassandraWriter {
 
                     txToWrite++;
 
-                    // try to see if input required are already in redis RAM cache, and push outputs in there
-                    this._getSetTxIO(row.coinbase ,row.tx_hash, jsonObj.inputs, row.outputs).then((txIOresponse)=>{
 
-                        // abort if job is aborted
-                        if(this._jobErrors.hasOwnProperty(jobname)==false  || this._jobErrors[jobname].length>0) {
-                            return;
+                    // abort if job is aborted
+                    if(this._jobErrors.hasOwnProperty(jobname)==false  || this._jobErrors[jobname].length>0) {
+                        return;
+                    }
+
+                    txWriten++;
+
+
+                    if(jsonObj.inputs.length!=0) {
+                        let inputList = [];
+                        // build input list
+                        for(let j=0;j<jsonObj.inputs.length;j++) {
+                            inputList.push([jsonObj.inputs[j].spent_transaction_hash,jsonObj.inputs[j].spent_output_index]);
                         }
+                        // if not, mark this transaction for later enrichment
+                        this._redisClient.lpush(this._currency+"::"+keyspace+"::btxs::"+jsonObj.block_number, 
+                            JSON.stringify({h:row.tx_hash,t:inputList, o:row.outputs}), (errLP,resLP)=>{
+                                if(errLP) {
+                                    this._logErrors("ERRROR: Unable to push block job data to redis:"+errLP);
+                                }
+                            });
+                    // a transaction can also have no input and be a coinbase
+                    } else {
+                        row.inputs = [];
+                        // obviously, a purely coinbase tx with no input is not a coinjoin
+                        row.coinjoin = false;
+                    }
 
-                        txWriten++;
+                    // save the tx summary to our maps (also increase writtenTx)
+                    this._addTransactionToBlockSummary(keyspace, jobname, row.height, row.tx_hash,
+                        row.inputs.length, row.outputs.length, row.total_input,
+                        row.total_output);
 
-                        // if we found corresponding utxo in redis
-                        if(txIOresponse.input_filled==true) {
-                            // report the inputs data
-                            row.inputs = txIOresponse.inputs;
-                            // detect coinjoin
-                            row.coinjoin = this._detectCoinjoin(row);
-                            //if(DUMP_METRICS)this._redisClient.INCR("1st-input-cache::success",1);
-                        } else if(jsonObj.inputs.length!=0) {
-                            let inputList = [];
-                            // build input list
-                            for(let j=0;j<jsonObj.inputs.length;j++) {
-                                inputList.push([jsonObj.inputs[j].spent_transaction_hash,jsonObj.inputs[j].spent_output_index]);
-                            }
-                            // if not, mark this transaction for later enrichment
-                            this._redisClient.lpush(this._currency+"::"+keyspace+"::btxs::"+jsonObj.block_number, 
-                                JSON.stringify({h:row.tx_hash,t:inputList, o:row.outputs}), (errLP,resLP)=>{
-                                    if(errLP) {
-                                        this._logErrors("ERRROR: Unable to push block job data to redis:"+errLP);
-                                    }
-                                });
-                            //if(DUMP_METRICS)this._redisClient.INCR("1st-input-cache::failure",1);
-                        // a transaction can also have no input and be a coinbase
-                        } else {
-                            row.inputs = [];
-                            // obviously, a purely coinbase tx is not a coinjoin
-                            row.coinjoin = false;
-                        }
-
-                        // save the tx summary to our maps (also increase writtenTx)
-                        this._addTransactionToBlockSummary(keyspace, jobname, row.height, row.tx_hash,
-                            row.inputs.length, row.outputs.length, row.total_input,
-                            row.total_output);
-
-                        // initalize request row and prepare it to be sent with others
-                        queries.push({
-                            query: push_transaction_query,
-                            params: [row.tx_prefix, row.tx_hash, row.tx_index, row.height, row.timestamp, row.coinbase, row.total_input, row.total_output, row.inputs, row.outputs, row.coinjoin]
-                        });
-
-                        // if the transaction was a garbage collection, clean the garbage
-                        if(garbageCollection==true) {
-                            this._garbageCollection[jobname] = [];
-                        }
-
-                        if(this._garbageCollection[jobname].length>=10) {
-                            this._logErrors("Maximum allowed number of transaction garbage collection reached !");
-                            process.exit(1);
-                        }
-
-                        // if we are done, call the final callback
-                        if(txWriten>=txToWrite)callbackWrite();
+                    // initalize request row and prepare it to be sent with others
+                    queries.push({
+                        query: push_transaction_query,
+                        params: [row.tx_prefix, row.tx_hash, row.tx_index, row.height, row.timestamp, row.coinbase, row.total_input, row.total_output, row.inputs, row.outputs, row.coinjoin]
                     });
+
+                    // if the transaction was a garbage collection, clean the garbage
+                    if(garbageCollection==true) {
+                        this._garbageCollection[jobname] = [];
+                    }
+
+                    if(this._garbageCollection[jobname].length>=10) {
+                        this._logErrors("Maximum allowed number of transaction garbage collection reached !");
+                        process.exit(1);
+                    }
+
+                    // if we are done, call the final callback
+                    if(txWriten>=txToWrite)callbackWrite();
                 } catch(err) {
                     // this is a tricky part, our pipe sometimes break down lines
                     // we must collect the garbage and try to glue it into a valid json
