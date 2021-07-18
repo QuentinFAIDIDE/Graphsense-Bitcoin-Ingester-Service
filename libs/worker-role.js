@@ -110,7 +110,7 @@ class WorkerRole {
             // we start polling for one
             this._jobCount++;
             this._pollForJob(this._jobCount-1).then((jobname)=>{
-                if(jobname!="no job found")
+                if(jobname!="no job found" && jobname)
                     this._debug("Worker finished job:"+jobname);
                 this._jobCount--;
             }).catch((err)=>{

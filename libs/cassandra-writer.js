@@ -819,8 +819,8 @@ class CassandraWriter {
                             this._garbageCollection[jobname] = [];
                         }
 
-                        if(this._garbageCollection[jobname].length!=0) {
-                            this._logErrors("A transaction worked despise the garbage collection list not being empty!!");
+                        if(this._garbageCollection[jobname].length>=10) {
+                            this._logErrors("Maximum allowed number of transaction garbage collection reached !");
                             process.exit(1);
                         }
 
