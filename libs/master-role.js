@@ -568,7 +568,7 @@ class MasterRole {
                     // create a new multi
                     let multIncr = this._redisClient.multi();
                     // for each txCount we got for all jobs
-                    for(let i=0;i<resMUL1.length;i++) {
+                    for(let i=0;i<enrichJobFinishedIterator;i++) {
                         // just in case a tx count was missing for a job
                         if(resMUL1[i]==null) {
                             // TODO: mark keyspace as broken in case this error happens one day

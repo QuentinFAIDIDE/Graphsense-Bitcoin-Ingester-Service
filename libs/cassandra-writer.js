@@ -804,6 +804,7 @@ class CassandraWriter {
                         this._redisClient.sadd(this._currency+"::"+keyspace+"::btxs::"+jsonObj.block_number, 
                             JSON.stringify({h:row.tx_hash,t:inputList, o:row.outputs}), (errLP,resLP)=>{
                                 if(errLP) {
+                                    // TODO: Mark job as broken and shutdown this replica
                                     this._logErrors("ERRROR: Unable to push block job data to redis:"+errLP);
                                 }
                             });
