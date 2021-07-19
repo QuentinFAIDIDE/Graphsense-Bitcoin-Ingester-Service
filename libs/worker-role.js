@@ -391,9 +391,17 @@ class WorkerRole {
                 this._cassandraWriter.prepareForKeyspace(keyspace).then(()=>{
                     // register job error watcher
                     try {
+                        // prevent race conditions
+                        let alreadyCalledBack = false;
                         // this also register the callback for when all the write have been confirmed
                         this._cassandraWriter.registerFillingJob(jobname, ()=>{
                             this._cassandraWriter.getFillingJobStatus(jobname).then((err)=>{
+                                // prevent race conditions that may occur on error handling and waiting for cassandra I/O simultaneously
+                                if(alreadyCalledBack==false) {
+                                    alreadyCalledBack = true;
+                                } else {
+                                    return;
+                                }
                                 if(err==null) {
                                     this._moveJobFromDoingToDone(jobname).then(resolve).catch(reject);
                                     // now let the master know this range is finished
@@ -499,7 +507,7 @@ class WorkerRole {
                 // check if we indeed removed something
                 // if not throw an error
                 if(resLREM==0) {
-                    reject("Job was not found in the doing list !");
+                    reject("Job missing from todo list:"+jobname);
                     return;
                 }
 
