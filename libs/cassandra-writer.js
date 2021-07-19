@@ -293,8 +293,7 @@ class CassandraWriter {
         let hasStoppedDueToError = false;
         // launch the redis call to get all tx for this block
         let multi = this._redisClient.multi();
-        multi.lrange(this._currency.toUpperCase()+"::"+keyspace+"::btxs::"+(Number(firstblock)+i), 0, -1);
-        multi.del(this._currency.toUpperCase()+"::"+keyspace+"::btxs::"+(Number(firstblock)+i));
+        multi.smembers(this._currency.toUpperCase()+"::"+keyspace+"::btxs::"+(Number(firstblock)+i));
         multi.exec((errMul,resMul)=>{
             if(errMul) {
                 this._logErrors("REDIS ERROR (_iterateOverEnrichingBlocks): "+errMul);
@@ -463,6 +462,25 @@ class CassandraWriter {
     }
 
     _clearEnrichingJob(jobname) {
+
+        // firstly we will clear the sets with txs to enrich per blocks
+        let keyspace = jobname.split("::")[0];
+        let range = jobname.split("::")[3].split(",");
+
+        let mult = this._redisClient.multi();
+
+        for(let i=Number(range[0]);i<=Number(range[1]);i++) {
+            mult.del(this._currency.toUpperCase()+"::"+keyspace+"::btxs::"+i);
+        }
+
+        mult.exec((errMul,resMul)=>{
+            if(errMul) {
+                this._logErrors("Unable to clear redis from old tx block data");
+                this._logErrors(errMul);
+            }
+        });
+
+        // finally we clear the job data
         delete this._jobErrors[jobname];
         delete this._totalBlocksPerJob[jobname];
         delete this._writtenBlocksPerJob[jobname];
@@ -705,6 +723,7 @@ class CassandraWriter {
             }
             // send the writes
             this._cassandraDrivers[keyspace].batch(queries, {prepare:true}).then(()=>{
+                if(this._jobErrors.hasOwnProperty(jobname)==false)return;
                 // failure or not, we need to know when all tx have been received to start recovering
                 // hence the count and test
                 this._jobTxCount[jobname].txReceived+=queries.length;
@@ -719,6 +738,7 @@ class CassandraWriter {
                     }
                 }
             }).catch((err)=>{
+                if(this._jobErrors.hasOwnProperty(jobname)==false)return;
                 this._manageCassandraErrorsForJob(jobname, err, queries, "transaction");
                 this._jobTxCount[jobname].txReceived+=queries.length;
                 if(this._jobTxCount[jobname].txReceived>=this._jobTxCount[jobname].txToWrite) {
@@ -781,7 +801,7 @@ class CassandraWriter {
                             inputList.push([jsonObj.inputs[j].spent_transaction_hash,jsonObj.inputs[j].spent_output_index]);
                         }
                         // if not, mark this transaction for later enrichment
-                        this._redisClient.lpush(this._currency+"::"+keyspace+"::btxs::"+jsonObj.block_number, 
+                        this._redisClient.sadd(this._currency+"::"+keyspace+"::btxs::"+jsonObj.block_number, 
                             JSON.stringify({h:row.tx_hash,t:inputList, o:row.outputs}), (errLP,resLP)=>{
                                 if(errLP) {
                                     this._logErrors("ERRROR: Unable to push block job data to redis:"+errLP);

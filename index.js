@@ -96,3 +96,10 @@ let replicaScheduler = new ReplicaScheduler(REDIS_HOST, REDIS_PORT, CURRENCY_SYM
 // start it
 replicaScheduler.startScheduler();
 workerManager.startWorker();
+
+// in case of unhandled rejection, abort
+process.on("unhandledRejection", err => {
+    logErrors(err);
+    console.log("Terminating because of unhandled promise rejection.");
+    process.exit(1);
+});

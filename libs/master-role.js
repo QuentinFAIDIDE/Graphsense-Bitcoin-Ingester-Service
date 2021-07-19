@@ -5,7 +5,7 @@ var { CassandraWriter } = require("./cassandra-writer.js");
 
 var MASTER_JOBCHECK_INTERVAL = 30000;
 var CALLROLL_DELAY = 3000;
-var BLOCK_BATCH_SIZE = 100;
+var BLOCK_BATCH_SIZE = 75;
 var MIN_RATE_DATE = "2010-10-17";
 
 var MAX_TODO_STACK_LEN = 15;
@@ -418,6 +418,9 @@ class MasterRole {
                     else return 1;
                 });
 
+                // ranges to simply clear
+                let ranges_to_clear = [];
+
                 // increment over each job to increment the last block where all previous are filled
                 let lastFilledBlock = Number(keyspaceobj.lastFilledBlock);
                 let allBlocksBeforeAreFilled = true;
@@ -428,6 +431,12 @@ class MasterRole {
                         // change lastFilledBlock and iterate over next one
                         lastFilledBlock=ranges[fillJobFinishedIterator][1];
                         fillJobFinishedIterator++;
+                    // if a race condition hapenned and we have already done this range
+                    } else if (ranges[fillJobFinishedIterator][1]<(lastFilledBlock+1)) {
+                        // mark the range as needing to be cleared from list
+                        ranges_to_clear.push(ranges[fillJobFinishedIterator]);
+                        // pop this out and repeat without incrementing
+                        ranges.splice(fillJobFinishedIterator,1);
                     // if not, break out of the loop since we have a gap
                     } else {
                         allBlocksBeforeAreFilled=false;
@@ -454,6 +463,11 @@ class MasterRole {
                     jobname = keyspaceobj.name+"::ENRICH_BLOCK_RANGE::"+ranges[i][0]+","+ranges[i][1];
                     // push the job in the redis bulk call objects
                     multi.lpush(this._currency.toUpperCase()+"::jobs::todo", jobname);
+                }
+
+                // delete ranges to clear
+                for(let i=0;i<ranges_to_clear.length;i++) {
+                    multi.lrem(""+this._currency.toUpperCase()+"::filled-ranges::"+keyspaceobj.name, 1, ranges_to_clear[i][0]+","+ranges_to_clear[i][1]);
                 }
 
                 // let's now update the lastFilledBlock variable
@@ -498,6 +512,8 @@ class MasterRole {
                     else return 1;
                 });
 
+                let ranges_to_clear = [];
+
                 // increment over each job to increment the last block where all previous are enriched
                 let lastEnrichedBlock = -1;
                 if(keyspaceobj.hasOwnProperty("lastEnrichedBlock")==true) {
@@ -511,13 +527,16 @@ class MasterRole {
                         // change lastEnrichedBlock and iterate over next one
                         lastEnrichedBlock=ranges[enrichJobFinishedIterator][1];
                         enrichJobFinishedIterator++;
-                    // if not, break out of the loop since we have a gap
+                    } else if (ranges[enrichJobFinishedIterator][1]<(lastEnrichedBlock+1)) {
+                        // mark the range as needing to be cleared from list
+                        ranges_to_clear.push(ranges[enrichJobFinishedIterator]);
+                        // pop this out and repeat without incrementing
+                        ranges.splice(enrichJobFinishedIterator,1);
+                        // if not, break out of the loop since we have a gap
                     } else {
                         allBlocksBeforeAreEnriched=false;
                     }
                 }
-
-
 
                 // if nothing changed, return 
                 if(enrichJobFinishedIterator==0) {
@@ -533,6 +552,11 @@ class MasterRole {
                 for(let i=0;i<enrichJobFinishedIterator;i++) {
                     // get tx counts for job
                     multi.get(""+this._currency.toUpperCase()+"::job_stats::"+ keyspaceobj.name+"::"+ranges[i][0]+","+ranges[i][1]);
+                }
+
+                // let's also delete rabges that potential race condition caused
+                for(let i=0;i<ranges_to_clear.length;i++) {
+                    multi.lrem(""+this._currency.toUpperCase()+"::"+keyspaceobj.name+"::enriched-ranges", 1, ""+ranges_to_clear[i][0]+","+ranges_to_clear[i][1]);
                 }
 
                 multi.exec((errMUL1, resMUL1)=>{
