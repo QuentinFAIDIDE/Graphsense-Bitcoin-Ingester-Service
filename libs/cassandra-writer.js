@@ -644,7 +644,7 @@ class CassandraWriter {
         });
     }
 
-    _clearAndTerminate(jobname) {
+    _terminateFillingJob(jobname) {
         // push total number of tx and blocks in redis for later incr after enrich
         // TODO: error handling with marking job as broken if job data already got cleared and on redis errors?
         this._redisClient.set(""+this._currency.toUpperCase()+"::job_stats::"
@@ -973,7 +973,7 @@ class CassandraWriter {
         // if there are not errors to recover, do nufin
         if(totalToRecover==0) {
             this._debug("No error to recover, cleaning up job auxiliary objects...");
-            this._clearAndTerminate(jobname);
+            this._terminateFillingJob(jobname);
             return;
         }
 
@@ -995,7 +995,7 @@ class CassandraWriter {
                 }
                 // fire the end of job callback, the calling service 
                 // must now get the job status to know about errors
-                this._clearAndTerminate(jobname);
+                this._terminateFillingJob(jobname);
                 return;
             }
         };

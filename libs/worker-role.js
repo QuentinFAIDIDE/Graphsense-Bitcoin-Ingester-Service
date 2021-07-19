@@ -10,7 +10,7 @@ const randomstring = require("randomstring");
 
 let MAX_JOBS_PER_REPLICA = 1;
 // the best value to avoid crashing a single bitcoin node
-let MAX_FILL_CONCURRENCY = 4;
+let MAX_FILL_CONCURRENCY = 5;
 
 class WorkerRole {
     /*
@@ -452,10 +452,17 @@ class WorkerRole {
                     return;
                 }
 
+                let returned = false;
+
                 // prepare the keyspace if it's not
                 this._cassandraWriter.prepareForKeyspace(keyspace).then(()=>{
                     // prepare for the job and allocate necessary objects
                     this._cassandraWriter.registerEnrichingJob(jobname, (err)=>{
+                        if(returned==false) {
+                            returned = true;
+                        } else {
+                            return;
+                        }
                         if(err==null) {
                             // save the job range as done for master to increment keyspace statistics
                             this._redisClient.rpush(""+this._currency.toUpperCase()+"::"+keyspace+"::enriched-ranges", ""+minblock+","+maxblock,
@@ -507,7 +514,7 @@ class WorkerRole {
                 // check if we indeed removed something
                 // if not throw an error
                 if(resLREM==0) {
-                    reject("Job missing from todo list:"+jobname);
+                    reject("Job missing from doing list:"+jobname);
                     return;
                 }
 
