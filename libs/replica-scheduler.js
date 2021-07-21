@@ -2,13 +2,13 @@ var redis = require("redis");
 var cq = require("concurrent-queue");
 var randomstring = require("randomstring");
 
-var TIMEOUT_SIMPLE_REQUEST = 200;
-var LOCK_TIMEOUT = 5000;
-var TIMEOUT_START_MASTER = 5000;
+var TIMEOUT_SIMPLE_REQUEST = 7000;
+var LOCK_TIMEOUT = 20000;
+var TIMEOUT_START_MASTER = 10000;
 
 
 // the desired probability for two repilca to health check in the same second together
-var HEALTH_CHECK_RACE_PROBA_SECOND = 0.04;
+var HEALTH_CHECK_RACE_PROBA_SECOND = 0.02;
 // we will dynamically scale our random numbers and jitters to have 
 // control over the probabilities of race conditions given number of replicas
 // the statistical analysis js code has a function for that
@@ -173,6 +173,7 @@ class ReplicaScheduler {
                 // save the number of replicas
                 this._nreplicas = Number(parameters[0]);
                 this._healthCheckRateSec = findDistributedProtocolFreq(HEALTH_CHECK_RACE_PROBA_SECOND, this._nreplicas);
+                this._debug("Health check was computed to have a probability of "+this._healthCheckRateSec+" to happen at every second.");
             }
         } catch (err) {
             this._logErrors(

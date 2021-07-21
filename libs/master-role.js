@@ -3,12 +3,12 @@ var randomstring = require("randomstring");
 var request =require("request");
 var { CassandraWriter } = require("./cassandra-writer.js");
 
-var MASTER_JOBCHECK_INTERVAL = 30000;
-var CALLROLL_DELAY = 3000;
+var MASTER_JOBCHECK_INTERVAL = 40000;
+var CALLROLL_DELAY = 6000;
 var BLOCK_BATCH_SIZE = 75;
 var MIN_RATE_DATE = "2010-10-17";
 
-var MAX_TODO_STACK_LEN = 15;
+var MAX_TODO_STACK_LEN = 40;
 
 var RATE_WRITING_LOCK_TIMEOUT = 60000*10;
 

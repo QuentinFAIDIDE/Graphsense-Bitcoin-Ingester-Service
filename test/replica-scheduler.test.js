@@ -83,9 +83,9 @@ describe("Testing replica scheduler", function () {
                     // now, recall function
                     waitAndCheck();
                 }
-            }, 5000);
+            }, 20000);
         }
 
-        setTimeout(()=>{waitAndCheck();}, 10000);
+        setTimeout(()=>{waitAndCheck();}, 20000);
     });
 });
