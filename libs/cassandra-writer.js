@@ -16,6 +16,12 @@ var write_stats_query = "INSERT INTO summary_statistics (id, no_blocks, no_txs, 
 
 var KEYSPACE_REGEXP = /^[a-z0-9_]{1,48}$/;
 
+// environnement variable to ignore block_transaction table
+var IGNORE_BLOCK_TRANSACTION = process.env.IGNORE_BLOCK_TRANSACTION;
+if(IGNORE_BLOCK_TRANSACTION!="true") {
+    IGNORE_BLOCK_TRANSACTION = false;
+}
+
 var DUMP_METRICS = process.env.DUMP_METRICS;
 if(DUMP_METRICS!="true")DUMP_METRICS="false"; 
 
@@ -420,6 +426,10 @@ class CassandraWriter {
                 if(err) {
                     failedCassandraRead=true;
                 } else {
+                    if(typeof transac == "undefined") {
+                        this._logErrors("FATAL: Unable to find transaction "+inputData.t[j][0]);
+                        process.exit(1);
+                    }
                     // TODO: find out why request return null (failed write for filling ??)
                     // if no error, get the right output and set it as the input
                     txInputs[j] = transac.outputs[inputData.t[j][1]];
@@ -609,17 +619,13 @@ class CassandraWriter {
 
     _writeBlockTransactionSummary(keyspace, jobname, height) {
         // create the row with all the txs
-        let row = new this._blockTransactionsModels[keyspace]({
+        let row = new this._blockTransactionsModels[keyspace]();
+        // now write the row
+        this._insertBlockTransactionToCassandra({
             height: Number(height),
             txs: this._blockTransactionMaps[jobname][height].tx_summary_list
-        });
-        // now write the row
-        row.save((err)=>{
-            if(err) {
-                this._manageCassandraErrorsForJob(jobname, err, [height], "block_transactions");
-                return;
-            }
-            
+        }).then(()=>{
+
             // increment block summary written
             this._writtenBlocksPerJob[jobname]++;
 
@@ -635,11 +641,47 @@ class CassandraWriter {
                 }
             } else {
                 // if not the last block, clear at least this block txs
-                // we want to avoid blowing up nodejs limited memory stack to maintain descent replicas error rates
                 if(this._blockTransactionsModels.hasOwnProperty(jobname) && 
                    this._blockTransactionsModels[jobname].hasOwnProperty(height)) {
                     delete this._blockTransactionMaps[jobname][height];
                 }
+            }
+        }).catch((err)=>{
+            this._manageCassandraErrorsForJob(jobname, err, [height], "block_transactions");
+
+            // if last block
+            if(this._writtenBlocksPerJob[jobname]>=this._totalBlocksPerJob[jobname]) {
+                this._debug("Job "+jobname+" received all transactions and blocks (last block_transaction was a failure)...");
+                // now if all transaction were received, execute the cleanup
+                if(this._jobTxCount[jobname].txReceived>=this._jobTxCount[jobname].txToWrite) {
+                    // if all blocks have been received and filled with txs
+                    if(this._jobTxCount[jobname].blocks_finished==true) {
+                        this._recoverFillJobErrors(keyspace, jobname);
+                    }
+                }
+            }
+
+            return;
+        });
+    }
+
+    _insertBlockTransactionToCassandra(block_tx) {
+        return new Promise((resolve, reject)=>{
+            // if we deactivated the block_transaction table
+            if(IGNORE_BLOCK_TRANSACTION=="true") {
+                resolve();
+                return;
+            } else {
+                let row = new this._blockTransactionsModels[keyspace](block_tx);
+                row.save((err)=>{
+                    if(err) {
+                        reject(err);
+                        return;
+                    }
+                    resolve();
+                    return;
+                })
+                return;
             }
         });
     }
@@ -785,47 +827,6 @@ class CassandraWriter {
 
                     txToWrite++;
 
-
-                    // abort if job is aborted
-                    if(this._jobErrors.hasOwnProperty(jobname)==false  || this._jobErrors[jobname].length>0) {
-                        return;
-                    }
-
-                    txWriten++;
-
-
-                    if(jsonObj.inputs.length!=0) {
-                        let inputList = [];
-                        // build input list
-                        for(let j=0;j<jsonObj.inputs.length;j++) {
-                            inputList.push([jsonObj.inputs[j].spent_transaction_hash,jsonObj.inputs[j].spent_output_index]);
-                        }
-                        // if not, mark this transaction for later enrichment
-                        this._redisClient.sadd(this._currency+"::"+keyspace+"::btxs::"+jsonObj.block_number, 
-                            JSON.stringify({h:row.tx_hash,t:inputList, o:row.outputs}), (errLP,resLP)=>{
-                                if(errLP) {
-                                    // TODO: Mark job as broken and shutdown this replica
-                                    this._logErrors("ERRROR: Unable to push block job data to redis:"+errLP);
-                                }
-                            });
-                    // a transaction can also have no input and be a coinbase
-                    } else {
-                        row.inputs = [];
-                        // obviously, a purely coinbase tx with no input is not a coinjoin
-                        row.coinjoin = false;
-                    }
-
-                    // save the tx summary to our maps (also increase writtenTx)
-                    this._addTransactionToBlockSummary(keyspace, jobname, row.height, row.tx_hash,
-                        row.inputs.length, row.outputs.length, row.total_input,
-                        row.total_output);
-
-                    // initalize request row and prepare it to be sent with others
-                    queries.push({
-                        query: push_transaction_query,
-                        params: [row.tx_prefix, row.tx_hash, row.tx_index, row.height, row.timestamp, row.coinbase, row.total_input, row.total_output, row.inputs, row.outputs, row.coinjoin]
-                    });
-
                     // if the transaction was a garbage collection, clean the garbage
                     if(garbageCollection==true) {
                         this._garbageCollection[jobname] = [];
@@ -836,8 +837,52 @@ class CassandraWriter {
                         process.exit(1);
                     }
 
-                    // if we are done, call the final callback
-                    if(txWriten>=txToWrite)callbackWrite();
+                    // set and get tx input outputs
+                    this._getSetTxIO(row.coinbase, row.tx_hash, row.inputs, row.outputs).then((txIOResponse)=>{
+
+                        // abort if job is aborted
+                        if(this._jobErrors.hasOwnProperty(jobname)==false  || this._jobErrors[jobname].length>0) {
+                            return;
+                        }
+
+                        txWriten++;
+
+
+                        if(jsonObj.inputs.length!=0) {
+                            let inputList = [];
+                            // build input list
+                            for(let j=0;j<jsonObj.inputs.length;j++) {
+                                inputList.push([jsonObj.inputs[j].spent_transaction_hash,jsonObj.inputs[j].spent_output_index]);
+                            }
+                            // if not, mark this transaction for later enrichment
+                            this._redisClient.sadd(this._currency+"::"+keyspace+"::btxs::"+jsonObj.block_number, 
+                                JSON.stringify({h:row.tx_hash,t:inputList, o:row.outputs}), (errLP,resLP)=>{
+                                    if(errLP) {
+                                        // TODO: Mark job as broken and shutdown this replica
+                                        this._logErrors("ERRROR: Unable to push block job data to redis:"+errLP);
+                                    }
+                                });
+                        // a transaction can also have no input and be a coinbase
+                        } else {
+                            row.inputs = [];
+                            // obviously, a purely coinbase tx with no input is not a coinjoin
+                            row.coinjoin = false;
+                        }
+
+                        // save the tx summary to our maps (also increase writtenTx)
+                        this._addTransactionToBlockSummary(keyspace, jobname, row.height, row.tx_hash,
+                            row.inputs.length, row.outputs.length, row.total_input,
+                            row.total_output);
+
+                        // initalize request row and prepare it to be sent with others
+                        queries.push({
+                            query: push_transaction_query,
+                            params: [row.tx_prefix, row.tx_hash, row.tx_index, row.height, row.timestamp, row.coinbase, row.total_input, row.total_output, row.inputs, row.outputs, row.coinjoin]
+                        });
+
+                        // if we are done, call the final callback
+                        if(txWriten>=txToWrite)callbackWrite();
+                    });
                 } catch(err) {
                     // this is a tricky part, our pipe sometimes break down lines
                     // we must collect the garbage and try to glue it into a valid json
