@@ -621,7 +621,7 @@ class CassandraWriter {
         // create the row with all the txs
         let row = new this._blockTransactionsModels[keyspace]();
         // now write the row
-        this._insertBlockTransactionToCassandra({
+        this._insertBlockTransactionToCassandra(keyspace, {
             height: Number(height),
             txs: this._blockTransactionMaps[jobname][height].tx_summary_list
         }).then(()=>{
@@ -665,7 +665,7 @@ class CassandraWriter {
         });
     }
 
-    _insertBlockTransactionToCassandra(block_tx) {
+    _insertBlockTransactionToCassandra(keyspace, block_tx) {
         return new Promise((resolve, reject)=>{
             // if we deactivated the block_transaction table
             if(IGNORE_BLOCK_TRANSACTION=="true") {
@@ -680,7 +680,7 @@ class CassandraWriter {
                     }
                     resolve();
                     return;
-                })
+                });
                 return;
             }
         });
