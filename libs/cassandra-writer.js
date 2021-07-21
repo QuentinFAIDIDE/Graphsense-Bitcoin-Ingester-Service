@@ -295,7 +295,6 @@ class CassandraWriter {
 
     // TODO OPTIMIZATION: Launch block enrichment in parallell (todo after redis utxo cache setup)
     _iterateOverEnrichingBlocks(keyspace, jobname, firstblock, i=0) {
-        this._debug("Iteration over block "+(Number(firstblock)+i));
         let hasStoppedDueToError = false;
         // launch the redis call to get all tx for this block
         let multi = this._redisClient.multi();
@@ -424,6 +423,7 @@ class CassandraWriter {
             }, { select: ["tx_prefix","tx_hash","outputs"]}, (err, transac)=>{
                 // if error, stop right away and push 
                 if(err) {
+                    this.logErrors(err);
                     failedCassandraRead=true;
                 } else {
                     if(typeof transac == "undefined") {
