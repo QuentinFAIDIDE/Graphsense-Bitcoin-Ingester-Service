@@ -6,6 +6,10 @@ var ExpressCassandra = require("express-cassandra");
 const fs = require("fs");
 const { exec } = require("child_process");
 const cassandra = require("cassandra-driver");
+const IOredis = require("ioredis");
+
+// import utilitaries
+var { checkRequiredEnVar } = require("./utils.js");
 
 var MIN_CLIENT_INIT_TIME = 10000;
 var MAX_RETRY_CASSANDRA = 50;
@@ -16,11 +20,69 @@ var write_stats_query = "INSERT INTO summary_statistics (id, no_blocks, no_txs, 
 
 var KEYSPACE_REGEXP = /^[a-z0-9_]{1,48}$/;
 
-// environnement variable to ignore block_transaction table
+// environnement variables used here
 var IGNORE_BLOCK_TRANSACTION = process.env.IGNORE_BLOCK_TRANSACTION;
 if(IGNORE_BLOCK_TRANSACTION!="true") {
-    IGNORE_BLOCK_TRANSACTION = false;
+    IGNORE_BLOCK_TRANSACTION = "false";
 }
+
+var USING_REDIS_UTXO_CACHE = process.env.USING_REDIS_UTXO_CACHE;
+if(USING_REDIS_UTXO_CACHE!="true") {
+    USING_REDIS_UTXO_CACHE = "false";
+}
+
+var UTXO_CACHE_IS_CLUSTER = process.env.UTXO_CACHE_IS_CLUSTER;
+if(UTXO_CACHE_IS_CLUSTER!="true") {
+    UTXO_CACHE_IS_CLUSTER = "false";
+}
+
+var UTXO_CACHE_PASSWORD, USE_UTXO_CACHE_PASSWORD;
+
+// if using cache we need flush interval
+var UTXO_CACHE_FLUSH_INTERVAL, UTXO_CACHE_CLUSTER_ENDPOINTS, UTXO_CACHE_HOST, UTXO_CACHE_PORT;
+if(USING_REDIS_UTXO_CACHE=="true") {
+
+    UTXO_CACHE_PASSWORD = process.env.UTXO_CACHE_PASSWORD;
+    USE_UTXO_CACHE_PASSWORD = !(UTXO_CACHE_PASSWORD=="" || typeof UTXO_CACHE_PASSWORD!="string");
+    if(USE_UTXO_CACHE_PASSWORD==true)console.log("Using UTXO CACHE with password");
+
+
+    UTXO_CACHE_FLUSH_INTERVAL = process.env.UTXO_CACHE_FLUSH_INTERVAL;
+    checkRequiredEnVar(UTXO_CACHE_FLUSH_INTERVAL, "UTXO_CACHE_FLUSH_INTERVAL");
+    UTXO_CACHE_FLUSH_INTERVAL = Number(UTXO_CACHE_FLUSH_INTERVAL);
+
+    // if using cluster we need the endpoints
+    if(UTXO_CACHE_IS_CLUSTER=="true") {
+        console.log("Using a redis cluster as UTXO Cache");
+        try {
+            UTXO_CACHE_CLUSTER_ENDPOINTS = process.env.UTXO_CACHE_CLUSTER_ENDPOINTS;
+            checkRequiredEnVar(UTXO_CACHE_CLUSTER_ENDPOINTS, "UTXO_CACHE_CLUSTER_ENDPOINTS");
+            // parse endpoint
+            let endpointsRaw = UTXO_CACHE_CLUSTER_ENDPOINTS.split(",");
+            UTXO_CACHE_CLUSTER_ENDPOINTS = [];
+            for(let i=0;i<endpointsRaw.length;i++) {
+                UTXO_CACHE_CLUSTER_ENDPOINTS.push({
+                    port: endpointsRaw[i].split(":")[1],
+                    host: endpointsRaw[i].split(":")[0]
+                });
+            }
+            console.log("Redis UTXO cluster endpoints:");
+            console.log(JSON.stringify(UTXO_CACHE_CLUSTER_ENDPOINTS));
+        } catch(err) {
+            console.error("Fatal error while parsing UTXO endpoints:"+err);
+            process.exit(1);
+        }
+    } else {
+        console.log("Using a redis instance as UTXO Cache (as opposed to a cluster)");
+        // if not in cluster mode, we at least needs endpoint and port
+        UTXO_CACHE_HOST = process.env.UTXO_CACHE_HOST;
+        checkRequiredEnVar(UTXO_CACHE_HOST, "UTXO_CACHE_HOST");
+        UTXO_CACHE_PORT = process.env.UTXO_CACHE_PORT;
+        checkRequiredEnVar(UTXO_CACHE_PORT, "UTXO_CACHE_PORT");
+    }
+}
+
+
 
 var DUMP_METRICS = process.env.DUMP_METRICS;
 if(DUMP_METRICS!="true")DUMP_METRICS="false"; 
@@ -46,6 +108,35 @@ class CassandraWriter {
     constructor(redisHost, redisPort, symbol, logMessage, logErrors, debug) {
         // load a redis instance to increment on the write or save errors
         this._redisClient = redis.createClient({ port: redisPort, host: redisHost });
+
+        // ioredis instance for the UTXO cache if activated
+        this._redisUTXoCacheClient = null;
+        this._redisUTXoCachePipeline = null;
+
+        if(USING_REDIS_UTXO_CACHE=="true") {
+            // if we are using a cluster
+            if(UTXO_CACHE_IS_CLUSTER=="true") {
+                if(USE_UTXO_CACHE_PASSWORD==true) {
+                    console.log("Connection to UTXO_CACHE cluster with password");
+                    this._redisUTXoCacheClient = new IOredis.Cluster(UTXO_CACHE_CLUSTER_ENDPOINTS, {redisOptions: {password: UTXO_CACHE_PASSWORD}});
+                } else {
+                    console.log("Connection to UTXO_CACHE cluster (without password)");
+                    this._redisUTXoCacheClient = new IOredis.Cluster(UTXO_CACHE_CLUSTER_ENDPOINTS);
+                }
+            } else {
+                if(USE_UTXO_CACHE_PASSWORD==true) {
+                    console.log("Connection to UTXO_CACHE instance with password");
+                    this._redisUTXoCacheClient = new IOredis({
+                        port: UTXO_CACHE_PORT, 
+                        host: UTXO_CACHE_HOST,
+                        password: UTXO_CACHE_PASSWORD
+                    });
+                } else {
+                    console.log("Connection to UTXO_CACHE instance (without password)");
+                    this._redisUTXoCacheClient = new IOredis(UTXO_CACHE_PORT, UTXO_CACHE_HOST);
+                }
+            }
+        }
 
         this._currency = symbol;
         this._logMessage = logMessage;
@@ -423,7 +514,7 @@ class CassandraWriter {
             }, { select: ["tx_prefix","tx_hash","outputs"]}, (err, transac)=>{
                 // if error, stop right away and push 
                 if(err) {
-                    this.logErrors(err);
+                    this._logErrors(err);
                     failedCassandraRead=true;
                 } else {
                     if(typeof transac == "undefined") {
@@ -818,9 +909,9 @@ class CassandraWriter {
                         height: jsonObj.block_number,
                         timestamp: jsonObj.block_timestamp,
                         coinbase: jsonObj.is_coinbase,
-                        total_input: String(jsonObj.input_value),
+                        total_input: "0",
                         total_output: String(jsonObj.output_value),
-                        inputs: this._inputConvertETLtoGraphSense(jsonObj.inputs),
+                        inputs: null,
                         outputs: this._inputConvertETLtoGraphSense(jsonObj.outputs),
                         coinjoin: false
                     };
@@ -838,7 +929,7 @@ class CassandraWriter {
                     }
 
                     // set and get tx input outputs
-                    this._getSetTxIO(row.coinbase, row.tx_hash, row.inputs, row.outputs).then((txIOResponse)=>{
+                    this._getSetTxInOutCache(jsonObj.hash, jsonObj.inputs, row.outputs).then((found_inputs)=>{
 
                         // abort if job is aborted
                         if(this._jobErrors.hasOwnProperty(jobname)==false  || this._jobErrors[jobname].length>0) {
@@ -847,8 +938,19 @@ class CassandraWriter {
 
                         txWriten++;
 
-
-                        if(jsonObj.inputs.length!=0) {
+                        // if we found input data in the redis cache
+                        if(found_inputs != null) {
+                            // move back the input in the row to write
+                            row.inputs = found_inputs;
+                            // compute the total input value
+                            let totalInput = 0;
+                            for(let i=0;i<row.inputs.length;i++) {
+                                totalInput += row.inputs[i].value;
+                            }
+                            row.total_input = String(totalInput);
+                            // do the coinjoin detection
+                            row.coinjoin = this._detectCoinjoin({inputs: row.inputs, outputs: row.outputs});
+                        } else if(jsonObj.inputs.length!=0) {
                             let inputList = [];
                             // build input list
                             for(let j=0;j<jsonObj.inputs.length;j++) {
@@ -865,13 +967,14 @@ class CassandraWriter {
                         // a transaction can also have no input and be a coinbase
                         } else {
                             row.inputs = [];
+                            row.total_input = "0";
                             // obviously, a purely coinbase tx with no input is not a coinjoin
                             row.coinjoin = false;
                         }
 
                         // save the tx summary to our maps (also increase writtenTx)
                         this._addTransactionToBlockSummary(keyspace, jobname, row.height, row.tx_hash,
-                            row.inputs.length, row.outputs.length, row.total_input,
+                            jsonObj.inputs.length, row.outputs.length, row.total_input,
                             row.total_output);
 
                         // initalize request row and prepare it to be sent with others
@@ -888,11 +991,8 @@ class CassandraWriter {
                     // we must collect the garbage and try to glue it into a valid json
 
                     // if this tx data is a garbage collection, ignore the error
-                    if(garbageCollection==true) {
-                        this._debug("Garbage collection failed with size "+this._garbageCollection[jobname].length+", saving garbage for later.");
-                    } else {
+                    if(garbageCollection==false) {
 
-                        this._debug("Approximate Tx Buffer size that failed to parse (bytes): "+ String(txbuffer).length*2);
                         // if the json was cut down, save the part that is broken
                         if(String(err).indexOf("Unexpected end of JSON input")!=-1 || 
                         String(err).indexOf("in JSON at position")!=-1) {
@@ -912,15 +1012,100 @@ class CassandraWriter {
         }
     }
 
-    // save the tx_outputs in redis txhash::inputid - addresses_nb,addresses,value,type
-    // should take on about 1Gb of additional RAM not counting Redis fragmentation if saving
-    // 1000 blocks worth of tx output with required fields: 1000*2200*(7*(32+25+8+1)) = 1Gb
-    // out of 23 tx input sampled, 21 were referencing less than 1000 blocks old output
-    // so 1000 sounds like a good size/sucess compromise    
-    _getSetTxIO(coinbase ,tx_hash, inputs, outputs) {
+    // Save the tx_outputs in redis txhash::inputid - addresses_nb,addresses,value,type.
+    // Should take on about 1Gb of additional RAM not counting Redis fragmentation if saving
+    // 1000 blocks worth of tx output with required fields: 1000*2200*(7*(32+25+8+1)) = 1Gb.
+    // Out of 23 tx input sampled, 21 were referencing less than 1000 blocks old output.     
+    // TODO: encore all type of addresses efficiently and switch to using buffers
+    _getSetTxInOutCache(tx_hash, inputs, outputs) {
         return new Promise((resolve,reject)=>{
-            // TODO: implement bulked calls to a redis cache
-            resolve({input_filled:false});
+            // must resolve to false if input size is zero
+            if(inputs.length==0) {
+                resolve(null);
+                return;
+            }
+
+            // if redis UTXO cache is not used
+            if(USING_REDIS_UTXO_CACHE!="true") {
+                // stop and return
+                resolve(null);
+                return;
+            }
+
+            let inputsFound = [];
+
+            let spent_outputs = [];
+
+            // callback for when all tx inputs request are returned
+            let inputsToFind = inputs.length;
+            let nbInputFound=0;
+            let resolvedAlready = false;
+
+            let inputFoundCallback = (errGet, resGet, i)=>{
+                // if already returned, do nothing
+                if(resolvedAlready==true) {
+                    return;
+                }
+                // if error, log it and resolve null
+                if(errGet) {
+                    resolve(null);
+                    resolvedAlready=true;
+                    return;
+                }
+                    
+                // if nothing was found
+                if(resGet==null) {
+                    // return null and stop here (we do not support partial input writes yet)
+                    resolve(null);
+                    resolvedAlready=true;
+                    return;
+                } else {
+                    // but if the input is valid save it
+                    let outputObj =  JSON.parse(resGet);
+                    inputsFound[i] = {
+                        address: outputObj.a,
+                        value: outputObj.v,
+                        address_type: outputObj.t
+                    };
+                    // if it was the last one, return the list of inputs found
+                    if(nbInputFound>=inputsToFind) {
+                        resolvedAlready=true;
+                        resolve(inputsFound);
+                        // and delete outputs
+                        for(let i=0;i<spent_outputs.length;i++) {
+                            this._redisUTXoCacheClient.del(spent_outputs[i], (errDel, resDel)=>{
+                                if(errDel) {
+                                    this._logErrors(errDel);
+                                    return;
+                                }
+                            })
+                        }
+                    }
+                }
+            };
+
+            // save the tx outputs
+            for(let i=0;i<outputs.length;i++) {
+                this._redisUTXoCacheClient.set(tx_hash+":"+i, JSON.stringify({
+                    a: outputs[i].address,
+                    v: outputs[i].value,
+                    t: outputs[i].address_type
+                }), (errSet,resSet)=>{
+                    if(errSet) {
+                        this._logErrors("Error while saving tx output to redis cache.");
+                        this._logErrors(errSet);
+                    }
+                });
+            }
+
+            // get the tx inputs (and call the previously defined callback)
+            for(let i=0;i<inputs.length;i++) {
+                spent_outputs.push(inputs[i].spent_transaction_hash+":"+inputs[i].spent_output_index);
+                this._redisUTXoCacheClient.get(inputs[i].spent_transaction_hash+":"+inputs[i].spent_output_index, (errGet, resGet)=>{
+                    nbInputFound++;
+                    inputFoundCallback(errGet, resGet, i);
+                });
+            }
         });
     }
 
