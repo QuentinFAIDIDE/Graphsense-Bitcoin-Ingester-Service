@@ -1078,7 +1078,7 @@ class CassandraWriter {
                                     this._logErrors(errDel);
                                     return;
                                 }
-                            })
+                            });
                         }
                     }
                 }
