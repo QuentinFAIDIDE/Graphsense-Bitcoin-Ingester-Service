@@ -20,6 +20,8 @@ var write_stats_query = "INSERT INTO summary_statistics (id, no_blocks, no_txs, 
 
 var KEYSPACE_REGEXP = /^[a-z0-9_]{1,48}$/;
 
+var MIN_METRICS_DUMP = 100;
+
 // environnement variables used here
 var IGNORE_BLOCK_TRANSACTION = process.env.IGNORE_BLOCK_TRANSACTION;
 if(IGNORE_BLOCK_TRANSACTION!="true") {
@@ -152,6 +154,14 @@ class CassandraWriter {
         this._blockTransactionsModels = {};
         this._exchangeRatesModels= {};
         this._cassandraDriversTimestamps = {};
+
+        // cache hit rate measurements (used only if DROP_METRICS is activated only)
+        this._upfrontUTXOCacheHit = 0;
+        this._upfrontUTXOCacheMiss = 0;
+        
+        if(DUMP_METRICS=="true") {
+            setInterval(()=>{this._dumpUpfrontCacheMetrics();}, 30000);
+        }
 
         // read the schema template synchronously
         // let's not take any risk with race conditions
@@ -1058,6 +1068,10 @@ class CassandraWriter {
                     // return null and stop here (we do not support partial input writes yet)
                     resolve(null);
                     resolvedAlready=true;
+                    // dump metric for the cache hit/miss rates
+                    if(DUMP_METRICS=="true") {
+                        this._upfrontUTXOCacheMiss++;
+                    }
                     return;
                 } else {
                     // but if the input is valid save it
@@ -1071,6 +1085,10 @@ class CassandraWriter {
                     if(nbInputFound>=inputsToFind) {
                         resolvedAlready=true;
                         resolve(inputsFound);
+                        // dump metric for the cache hit/miss rates
+                        if(DUMP_METRICS=="true") {
+                            this._upfrontUTXOCacheHit++;
+                        }
                         // and delete outputs
                         for(let i=0;i<spent_outputs.length;i++) {
                             this._redisUTXoCacheClient.del(spent_outputs[i], (errDel, resDel)=>{
@@ -1107,6 +1125,51 @@ class CassandraWriter {
                 });
             }
         });
+    }
+
+    _dumpUpfrontCacheMetrics() {
+        if((this._upfrontUTXOCacheHit+this._upfrontUTXOCacheMiss)>MIN_METRICS_DUMP) {
+            this._redisClient.incrby(this._currency.toUpperCase()+"::upfront-utxo-cache-hit", this._upfrontUTXOCacheHit, (errINC,resINC)=>{
+                this._redisClient.incrby(this._currency.toUpperCase()+"::upfront-utxo-cache-miss", this._upfrontUTXOCacheMiss, (errINC2,resINC2)=>{
+                    this._upfrontUTXOCacheHit=0;
+                    this._upfrontUTXOCacheMiss=0;
+                    // give it a slight change to check for reducing counters
+                    if(Math.random()<0.001) {
+                        this._redisClient.get(this._currency.toUpperCase()+"::upfront-utxo-cache-hit", (errGetHit, resGetHit)=>{
+                            if(errGetHit) {
+                                return;
+                            }
+                            this._redisClient.get(this._currency.toUpperCase()+"::upfront-utxo-cache-miss", (errGetMiss, resGetMiss)=>{
+                                if(errGetMiss) {
+                                    return;
+                                }
+                                let hit = 0;
+                                let miss = 0;
+                                if(resGetHit==null)hit=0;
+                                else hit = Number(resGetHit);
+                                if(resGetMiss==null)miss=0;
+                                else miss = Number(resGetMiss);
+
+                                // delete both if value are not numbers
+                                if( (Number.isNaN(hit)==true || Number.isNaN(miss)==true) ) {
+                                    this._redisClient.del(this._currency.toUpperCase()+"::upfront-utxo-cache-hit");
+                                    this._redisClient.del(this._currency.toUpperCase()+"::upfront-utxo-cache-miss");
+                                    return;
+                                }
+
+                                // divide by 10000000 if too big
+                                if( (hit+miss)>100000000000 ) {
+                                    this._redisClient.set(this._currency.toUpperCase()+"::upfront-utxo-cache-hit", Math.floor(hit/10000000));
+                                    this._redisClient.set(this._currency.toUpperCase()+"::upfront-utxo-cache-miss", Math.floor(miss/10000000));
+                                }
+
+                                return;
+                            });
+                        });
+                    }
+                });
+            });
+        }
     }
 
     // this function generate id with format [HEIGHT]0..0[TX_COUNT] as string
