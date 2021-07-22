@@ -943,6 +943,12 @@ class CassandraWriter {
 
     _recoverEnrichJobErrors(keyspace, jobname) {
 
+        // if race condition log it and stop
+        if(Object.prototype.hasOwnProperty.call(this._jobCassandraIORetryStack, jobname)==false) {
+            this._logErrors("_recoverEnrichJobErrors has been caled a second time, doing nothing.");
+            return;
+        }
+
         this._debug("Started error recovery routine...");
 
         let recoveredCount = 0;
