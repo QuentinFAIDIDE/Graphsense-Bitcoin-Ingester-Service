@@ -11,6 +11,7 @@ const randomstring = require("randomstring");
 let MAX_JOBS_PER_REPLICA = 1;
 // the best value to avoid crashing a single bitcoin node
 let MAX_FILL_CONCURRENCY = 9;
+let MAX_FILL_CONCURRENCY_PER_NODE = 9;
 
 class WorkerRole {
     /*
@@ -57,6 +58,10 @@ class WorkerRole {
         });
 
         this._jobCount = 0;
+
+        // schedules updates of dynamic concurrency setting depending on number of bitcoin nodes used
+        this._updateMaxFillConcurrencyInterval = Interval(()=>{this._updateMaxFillConcurrency();}, 120000);
+        this._updateMaxFillConcurrency();
     }
 
     // PRIVATE METHODS
@@ -564,6 +569,25 @@ class WorkerRole {
                     resolve();
                 });
             });
+        });
+    }
+
+    _updateMaxFillConcurrency() {
+        // get the number of bitcoin nodes available
+        this._redisClient.llen(this._currency+"::node-clients", (errLL, resLL)=>{
+            if(errLL) {
+                this._logErrors("Error while updating the fill job concurrency:"+errLL);
+                this._logErrors(errLL);
+                return;
+            }
+
+            // if nothing was found, set to as if there was only one node 
+            if(resLL==null || Number.isNaN(Number(resLL))==true || resLL==0) {
+                MAX_FILL_CONCURRENCY = MAX_FILL_CONCURRENCY_PER_NODE;
+            // if we have number of node, do the math
+            } else {
+                MAX_FILL_CONCURRENCY = MAX_FILL_CONCURRENCY_PER_NODE * Number(resLL);
+            }
         });
     }
 }
