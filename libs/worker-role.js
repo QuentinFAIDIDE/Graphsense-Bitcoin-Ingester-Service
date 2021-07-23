@@ -60,7 +60,7 @@ class WorkerRole {
         this._jobCount = 0;
 
         // schedules updates of dynamic concurrency setting depending on number of bitcoin nodes used
-        this._updateMaxFillConcurrencyInterval = Interval(()=>{this._updateMaxFillConcurrency();}, 120000);
+        this._updateMaxFillConcurrencyInterval = setInterval(()=>{this._updateMaxFillConcurrency();}, 120000);
         this._updateMaxFillConcurrency();
     }
 
