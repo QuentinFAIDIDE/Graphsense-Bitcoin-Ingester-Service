@@ -3,9 +3,9 @@ var randomstring = require("randomstring");
 var request =require("request");
 var { CassandraWriter } = require("./cassandra-writer.js");
 
-var MASTER_JOBCHECK_INTERVAL = 40000;
+var MASTER_JOBCHECK_INTERVAL = 25000;
 var CALLROLL_DELAY = 6000;
-var BLOCK_BATCH_SIZE = 75;
+var BLOCK_BATCH_SIZE = 200;
 var MIN_RATE_DATE = "2010-10-17";
 
 var MAX_TODO_STACK_LEN = 100;
@@ -493,7 +493,7 @@ class MasterRole {
     _checkErrorStack() {
         return new Promise((resolve, reject)=>{
             // get the first 50 elements of the error stack
-            this._redisClient.lrange(""+this._currency.toUpperCase()+"::jobs::errors", 0, 50, (errLR, resLR)=>{
+            this._redisClient.lrange(""+this._currency.toUpperCase()+"::jobs::errors", 0, 1000, (errLR, resLR)=>{
                 if(errLR) {
                     this._logErrors("Error at redis lrange in _checkErrorStack");
                     reject(errLR);
@@ -532,9 +532,9 @@ class MasterRole {
                         // if not recently seen, save it here in case we find it later
                         this._recentlySeenFailedJobs.push(jobShortnames[i]);
                         // trim the list if too big, and issue an alert
-                        if(this._recentlySeenFailedJobs.length>100) {
-                            this._logErrors("Master has seen more than 100 failed jobs. It is either due to a bug or to stressing too much cassandra or redis instances.");
-                            this._recentlySeenFailedJobs.splice(0, this._recentlySeenFailedJobs.length-100);
+                        if(this._recentlySeenFailedJobs.length>10000) {
+                            this._logErrors("Master has seen more than 10000 failed jobs. It is either due to a bug or to stressing too much cassandra or redis instances.");
+                            this._recentlySeenFailedJobs.splice(0, this._recentlySeenFailedJobs.length-10000);
                         }
                     }
                 }
@@ -544,6 +544,7 @@ class MasterRole {
                 let multi = this._redisClient.multi();
                 for(let i=0;i<resLR.length;i++) {
                     multi.lpush(this._currency.toUpperCase()+"::jobs::todo", jobShortnames[i]);
+                    multi.lrem(this._currency.toUpperCase()+"::jobs::errors", 1, resLR[i]);
                 }
 
                 // finally execute the redis multi and resolve
@@ -749,7 +750,7 @@ class MasterRole {
                         // if its worker has not response to calls
                         if(workers.includes(id)==false) {
                             // save it to move it later
-                            this._debug("Job "+resLR1[i]+" has no responding worker, moving back to todo.");
+                            this._logErrors("Job "+resLR1[i]+" has no responding worker under "+CALLROLL_DELAY+"ms, moving it back to todo list.");
                             abandonedJobs.push(resLR1[i]);
                         }
                     }

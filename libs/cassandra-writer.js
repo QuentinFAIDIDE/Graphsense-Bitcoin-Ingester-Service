@@ -174,6 +174,7 @@ class CassandraWriter {
             keyspace: "mykeyspace",
             localDataCenter: process.env.CASSANDRA_DATACENTER,
             queryOptions: {consistency: ExpressCassandra.consistencies.one},
+            pooling: {maxRequestsPerConnection: 4096},
             socketOptions: {
                 connectTimeout: 60000,
                 readTimeout: 120000
@@ -527,13 +528,18 @@ class CassandraWriter {
                     this._logErrors(err);
                     failedCassandraRead=true;
                 } else {
-                    if(typeof transac == "undefined") {
+                    if(typeof transac == "undefined" || transac==null) {
                         this._logErrors("FATAL: Unable to find transaction "+inputData.t[j][0]);
                         process.exit(1);
                     }
-                    // TODO: find out why request return null (failed write for filling ??)
                     // if no error, get the right output and set it as the input
                     txInputs[j] = transac.outputs[inputData.t[j][1]];
+                    // delete the unspent output from the redis cache
+                    if(USING_REDIS_UTXO_CACHE=="true") {
+                        this._redisUTXoCacheClient.del(inputData.t[j][0]+":"+inputData.t[j][1], (errDel)=>{
+                            if(errDel)this._logErrors("Failed to clear some cache data in redis cache:"+errDel);
+                        });
+                    }
                 }
                 foundInputCallback();
             });

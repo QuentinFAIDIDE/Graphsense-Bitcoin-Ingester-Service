@@ -10,7 +10,7 @@ const randomstring = require("randomstring");
 
 let MAX_JOBS_PER_REPLICA = 1;
 // the best value to avoid crashing a single bitcoin node
-let MAX_FILL_CONCURRENCY = 5;
+let MAX_FILL_CONCURRENCY = 9;
 
 class WorkerRole {
     /*
