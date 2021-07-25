@@ -20,13 +20,13 @@ You will need to:
 ## Discussing bottlenecks
 It is still hard to configure these microservices to work properly for a few reasons:
 - Either cassandra, redis, or bitcoin clients will be your bottleneck, and it may change as you progress.
-- They will take time to stop, and if you have weak hardware (ie lots of errors) you may need to scale the replicas on and off.
-- Cassandra may take more writes than it can handle and make errors rains.
-- Bitcoin Core clients return a 500 error when their max queue size for api requests are full.
+- There is no 'stop' button yet, you would if you need scale the microservice to zero.
+- Cassandra may take more writes than it can handle and make errors rains after its cache is full.
+- Bitcoin Core clients return a 500 error when their max queue size for api requests are full and should not be stressed.
 - You may have an easier time using this service with a Kubernetes or Docker Swarm cluster because of the wide variety of services required.
 - It requires lots of computing power to ingest at descent rates as the data volume is in terabytes.
 
-Hopefully, these are problems than can be overcome because:
+Hopefully, these are problems than could be overcome because:
 - You have a monitoring cli dashboard with error logs to find out which service is having failures and scale it up.
 - Every component (the software, redis, redis utxo cache, bitcoin clients or cassandra) can be scaled horizontally as long as you have the resources.
 - Automatic recovery of errors happens at two levels: internal to jobs for a few I/O failures in cassandra, and external to jobs with an errored jobs stack for more severe bitcoin client or cassandra errors that caused more than 100 failures per job. The failed job are then retry one time before marking the keyspace as broken and stopping new jobs creations.
