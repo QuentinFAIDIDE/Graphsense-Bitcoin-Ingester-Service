@@ -4,8 +4,46 @@ Micro-services that ingest Bitcoin blocks and transactions data in Cassandra fol
 
 This software is still in early alpha, many features are missing. Also, it is not an official graphsense project.
 
-## Behaviour
-Using a redis cache, a bitcoin core node, and a cassandra database, this software is consuming jobs to write bitcoin blocks and transactions in cassandra and is creating new jobs when new blocks appear for each keyspace configured for monitoring with a specific delay to guarantee blocks are unlikely to be reversed.
+## Usage
+This software has a separate CLI tool to interract with the replicated microservices.
+You will need to:
+- deploy the microservice
+- deploy the main redis cache
+- eventually (strongly advised) deploy the redis utxo cache as either Redis Cluster or standard Redis 
+- deploy Cassandra
+- deploy the bitcoin core clients
+- download the cli control tool
+- add your keyspace
+- open the dashboard to watch for errors (it may work for the first 300k blocks but have Cassandra dying under 400k/opsec later !)
+- adjust the number of microservice replica, the concurrencies, scale up your databases/caches, etc...
+
+## Discussing bottlenecks
+It is still hard to configure these microservices to work properly for a few reasons:
+- Either cassandra, redis, or bitcoin clients will be your bottleneck, and it may change as you progress.
+- They will take time to stop, and if you have weak hardware (ie lots of errors) you may need to scale the replicas on and off.
+- Cassandra may take more writes than it can handle and make errors rains.
+- Bitcoin Core clients return a 500 error when their max queue size for api requests are full.
+- You may have an easier time using this service with a Kubernetes or Docker Swarm cluster because of the wide variety of services required.
+- It requires lots of computing power to ingest at descent rates as the data volume is in terabytes.
+
+Hopefully, these are problems than can be overcome because:
+- You have a monitoring cli dashboard with error logs to find out which service is having failures and scale it up.
+- Every component (the software, redis, redis utxo cache, bitcoin clients or cassandra) can be scaled horizontally as long as you have the resources.
+- Automatic recovery of errors happens at two levels: internal to jobs for a few I/O failures in cassandra, and external to jobs with an errored jobs stack for more severe bitcoin client or cassandra errors that caused more than 100 failures per job. The failed job are then retry one time before marking the keyspace as broken and stopping new jobs creations.
+- If you are running graphsense chances are that you have enought processing power to make it easy to find your sweet spot.
+- There is an option to set up a redis UTXO cache, and it can even be set to use a distributed Redis Cluster. This can make the process incredibly more efficient and considerably reduce cassandra errors (because we do not need to read to Cassandra anymore most of the time).
+
+## Features for the future
+- Docker swarm stack compose yamls to have an easier time deploying the service.
+- Add a setting to thottle the Cassandra I/O 
+- Automatically scale the I/O to the components by monitoring error rates of each and have more explicit error messages.
+- Display more metrics in the dashboard to have a better understanding of bottleneck and requirements.
+- Allow microservices replicas to halt with a cli command.
+
+## Known bugs we plan on fixing (reminder that this is an alpha version)
+- With more than 60 microservice replicas, there is a possibility of a job loss bug that may softlock ingestion.
+- There is a missing input field in the lists from the `block_transaction` table when the redis utxo cache is not used (10% of transactions approximately are affected if you are using the utxo cache, 100% if not). This is not fatal to graphsense and there is also an option to ignore that table.
+- Some schema types has been changed in newer development Graphsense versions and we would need to make it compatible with future releases.
 
 ## Requirements 
 You will need:
@@ -58,6 +96,26 @@ export CASSANDRA_PORT="30730"
 export CASSANDRA_DATACENTER="datacenter1"
 ```
 
+To setup the UTXO Cache you can add these for a redis cluster:
+```bash
+export USING_REDIS_UTXO_CACHE="true"
+export UTXO_CACHE_IS_CLUSTER="true";
+export UTXO_CACHE_CLUSTER_ENDPOINTS="redis-utxo-cache-redis-cluster-3.redis-utxo-cache-redis-cluster-headless:6379,redis-utxo-cache-redis-cluster-2.redis-utxo-cache-redis-cluster-headless:6379,redis-utxo-cache-redis-cluster-0.redis-utxo-cache-redis-cluster-headless:6379"
+```
+
+And this for a redis single instance:
+```bash
+export USING_REDIS_UTXO_CACHE="true"
+export UTXO_CACHE_IS_CLUSTER="false";
+export UTXO_CACHE_PORT="6379";
+export UTXO_CACHE_HOST="127.0.0.1"
+```
+
+An option is also available to disable the `block_transaction` table:
+```bash
+export IGNORE_BLOCK_TRANSACTION="true"
+```
+
 You can then source the environnement variables and launch the nodejs program:
 ```bash
 source env.sh
@@ -72,7 +130,6 @@ node index.js
 ```
 
 ## Production deployments
-We will not cover the cassandra deployment.
 
 ### Docker Swarm
 **Todo**: Docker swarm docker-compose yaml for easy deployment.
