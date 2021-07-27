@@ -3,12 +3,19 @@ var randomstring = require("randomstring");
 var request =require("request");
 var { CassandraWriter } = require("./cassandra-writer.js");
 
-var MASTER_JOBCHECK_INTERVAL = 25000;
-var CALLROLL_DELAY = 6000;
+var MASTER_JOBCHECK_INTERVAL = 20000;
+var CALLROLL_DELAY = 10000;
 var BLOCK_BATCH_SIZE = 100;
 var MIN_RATE_DATE = "2010-10-17";
 
-var MAX_TODO_STACK_LEN = 200;
+// the maximum time a job can be in the todo queue before checking its exitence in todo and doing queues
+var JOB_LIFE_TIMEOUT = 60000*30;
+
+// the maximum number of jobs in the filled range stack before refusing to put further filling jobs
+// todo: implement that
+var MAX_JOB_TYPE_SPREAD = 1000;
+
+var MAX_TODO_STACK_LEN = 300;
 
 var RATE_WRITING_LOCK_TIMEOUT = 60000*10;
 
@@ -58,6 +65,10 @@ class MasterRole {
         this._cassandraWriter = new CassandraWriter(redisHost,redisPort, symbol, logMessage, logErrors, debug);
 
         this._recentlySeenFailedJobs = [];
+
+        // per keyspace list of submitted jobs with dates used to check for timeout (lost ones)
+        this._fillingJobsQueued = {};
+        this._enrichJobsQueued = {};
     }
 
     // PRIVATE METHODS
@@ -130,123 +141,129 @@ class MasterRole {
                         // check the error stack and either repost job or mark keyspace as broken
                         this._checkErrorStack().then(()=>{
 
-                            let totalNbKeyspaces = keyspaces.length;
-                            let processedKeyspaces = 0;
-                            
-                            // create a mult to bulk redis calls
-                            let mult = this._redisClient.multi();
+                            // check the list of posted jobs to delete those who are done and check the timed outs
+                            this._checkTimedOutJobs().then(()=>{
 
-                            let processingDoneCallback = ()=>{
-                                processedKeyspaces++;
-                                if(processedKeyspaces>=totalNbKeyspaces) {
-                                    // execute the db calls
-                                    mult.exec((errMult, resMult)=>{
-                                        if(errMult) {
-                                            this._logErrors(errMult);
-                                        } else {
-                                            this._debug("Succesfully updated monitored keyspaces and dead workers");
-                                        }
-                                    });
-                                }
-                            };
+                                let totalNbKeyspaces = keyspaces.length;
+                                let processedKeyspaces = 0;
+                                
+                                // create a mult to bulk redis calls
+                                let mult = this._redisClient.multi();
 
-                            this._debug("Keyspaces monitored found: "+JSON.stringify(keyspaces));
-
-                            // for each one, if it has been marked as to update continously
-                            for(let i=0; i<keyspaces.length;i++) {
-
-                                // ignore the keyspace if it's marked broken
-                                if(Object.prototype.hasOwnProperty.call(keyspaces[i], "broken")==true && keyspaces[i].broken=="true") {
-                                    continue;
-                                }
-
-                                // if keyspace has not been marked as "not to feed in" with feedFrom as -1
-                                if(keyspaces[i].feedFrom!=-1) {
-
-                                    // first, check if keyspace has filled block range further enough to pop new enrich jobs (requires to have all previous utxo)
-                                    this._updateLastFilledBlockAndPopEnrichJobs(keyspaces[i]).then(()=>{
-
-                                        this._updateLastEnrichedBlockAndStatistics(keyspaces[i]).then(()=>{
-
-                                            // if last block availabl minus confirm delay is bigger than last keyspace block
-                                            if(Number(keyspaces[i].lastQueuedBlock) < Number(maxheight) - Number(keyspaces[i].delay)) {
-                                                // push a job for the new block
-                                                let range = [Number(keyspaces[i].lastQueuedBlock)+1 ,Number(maxheight) - Number(keyspaces[i].delay)];
-                                                
-                                                let jobname = keyspaces[i].name+"::FILL_BLOCK_RANGE::"+range[0]+","+range[1];
-
-                                                let tasksPending = todoStackLength;
-                                        
-                                                // split job into subtask of blck size
-                                                let furthest_block_sent = Number(range[0]-1);
-                                                let end = Number(range[1]);
-                                                let split_size = BLOCK_BATCH_SIZE;
-                                                while ((furthest_block_sent + split_size) <= end && tasksPending<MAX_TODO_STACK_LEN) {
-                                                    tasksPending++;
-                                                    // sending job for subrange
-                                                    jobname = keyspaces[i].name+"::FILL_BLOCK_RANGE::"+
-                                                        (furthest_block_sent+1)+","+String(furthest_block_sent + split_size);
-                                                    // push the job in the redis bulk call objects
-                                                    mult.rpush(this._currency.toUpperCase()+"::jobs::todo", jobname);
-                                                    // increment to next batch
-                                                    furthest_block_sent += split_size;
-                                                }
-
-                                                // if there is a remainder, send it as well
-                                                if (furthest_block_sent < end && tasksPending<MAX_TODO_STACK_LEN) {
-                                                    // sending job for subrange
-                                                    jobname = keyspaces[i].name+"::FILL_BLOCK_RANGE::"+
-                                                        (furthest_block_sent+1)+","+(end);
-                                                    furthest_block_sent = end;
-                                                    // push the job in the redis bulk call objects
-                                                    mult.rpush(this._currency.toUpperCase()+"::jobs::todo", jobname);
-                                                }
-
-                                                // update the last queued block for the keyspace
-                                                mult.hset(this._currency.toUpperCase()+"::monitored::"+keyspaces[i].name, "lastQueuedBlock", furthest_block_sent);
+                                let processingDoneCallback = ()=>{
+                                    processedKeyspaces++;
+                                    if(processedKeyspaces>=totalNbKeyspaces) {
+                                        // execute the db calls
+                                        mult.exec((errMult, resMult)=>{
+                                            if(errMult) {
+                                                this._logErrors(errMult);
+                                            } else {
+                                                this._debug("Succesfully updated monitored keyspaces and dead workers");
                                             }
-                                            // detect lock to prevent rate writing race conditions 
-                                            let ratesWriting = false;
-                                            if(this._rateWritingLocks.hasOwnProperty(keyspaces[i].name)==true) {
-                                                // if lock is expired
-                                                if((Date.now()-this._rateWritingLocks[keyspaces[i].name])>RATE_WRITING_LOCK_TIMEOUT) {
-                                                    // ignore the lock and delete it
-                                                    delete this._rateWritingLocks[keyspaces[i].name];
-                                                // if lock is still valid, set bool as true
+                                        });
+                                    }
+                                };
+
+                                this._debug("Keyspaces monitored found: "+JSON.stringify(keyspaces));
+
+                                // for each one, if it has been marked as to update continously
+                                for(let i=0; i<keyspaces.length;i++) {
+
+                                    // ignore the keyspace if it's marked broken
+                                    if(Object.prototype.hasOwnProperty.call(keyspaces[i], "broken")==true && keyspaces[i].broken=="true") {
+                                        continue;
+                                    }
+
+                                    // if keyspace has not been marked as "not to feed in" with feedFrom as -1
+                                    if(keyspaces[i].feedFrom!=-1) {
+
+                                        // first, check if keyspace has filled block range further enough to pop new enrich jobs (requires to have all previous utxo)
+                                        this._updateLastFilledBlockAndPopEnrichJobs(keyspaces[i]).then(()=>{
+
+                                            this._updateLastEnrichedBlockAndStatistics(keyspaces[i]).then(()=>{
+
+                                                // if last block availabl minus confirm delay is bigger than last keyspace block
+                                                if(Number(keyspaces[i].lastQueuedBlock) < Number(maxheight) - Number(keyspaces[i].delay)) {
+                                                    // push a job for the new block
+                                                    let range = [Number(keyspaces[i].lastQueuedBlock)+1 ,Number(maxheight) - Number(keyspaces[i].delay)];
+                                                    
+                                                    let jobname = keyspaces[i].name+"::FILL_BLOCK_RANGE::"+range[0]+","+range[1];
+
+                                                    let tasksPending = todoStackLength;
+                                            
+                                                    // split job into subtask of blck size
+                                                    let furthest_block_sent = Number(range[0]-1);
+                                                    let end = Number(range[1]);
+                                                    let split_size = BLOCK_BATCH_SIZE;
+                                                    while ((furthest_block_sent + split_size) <= end && tasksPending<MAX_TODO_STACK_LEN) {
+                                                        tasksPending++;
+                                                        // sending job for subrange
+                                                        jobname = keyspaces[i].name+"::FILL_BLOCK_RANGE::"+
+                                                            (furthest_block_sent+1)+","+String(furthest_block_sent + split_size);
+                                                        // push the job in the redis bulk call objects
+                                                        mult.rpush(this._currency.toUpperCase()+"::jobs::todo", jobname);
+                                                        mult.rpush(this._currency.toUpperCase()+"::jobs::posted", ""+Date.now()+"::"+jobname);
+                                                        // increment to next batch
+                                                        furthest_block_sent += split_size;
+                                                    }
+
+                                                    // if there is a remainder, send it as well
+                                                    if (furthest_block_sent < end && tasksPending<MAX_TODO_STACK_LEN) {
+                                                        // sending job for subrange
+                                                        jobname = keyspaces[i].name+"::FILL_BLOCK_RANGE::"+
+                                                            (furthest_block_sent+1)+","+(end);
+                                                        furthest_block_sent = end;
+                                                        // push the job in the redis bulk call objects
+                                                        mult.rpush(this._currency.toUpperCase()+"::jobs::todo", jobname);
+                                                        mult.rpush(this._currency.toUpperCase()+"::jobs::posted", ""+Date.now()+"::"+jobname);
+                                                    }
+
+                                                    // update the last queued block for the keyspace
+                                                    mult.hset(this._currency.toUpperCase()+"::monitored::"+keyspaces[i].name, "lastQueuedBlock", furthest_block_sent);
+                                                }
+                                                // detect lock to prevent rate writing race conditions 
+                                                let ratesWriting = false;
+                                                if(this._rateWritingLocks.hasOwnProperty(keyspaces[i].name)==true) {
+                                                    // if lock is expired
+                                                    if((Date.now()-this._rateWritingLocks[keyspaces[i].name])>RATE_WRITING_LOCK_TIMEOUT) {
+                                                        // ignore the lock and delete it
+                                                        delete this._rateWritingLocks[keyspaces[i].name];
+                                                    // if lock is still valid, set bool as true
+                                                    } else {
+                                                        ratesWriting = true;
+                                                    }
+                                                }
+                                                // if the lock is set for the keyspace
+                                                if(ratesWriting==true) {
+                                                    // return and ignore the rate writing part
+                                                    processingDoneCallback();
+                                                    return;
+                                                }
+                                                // if rates were not set
+                                                if(keyspaces[i].hasOwnProperty("lastRatesWritten")==false) {
+                                                    // get yesterdays date in YYYY-MM-DD format
+                                                    let yestedayTxt = this._getYesterdayDateTxt();
+                                                    // call the function to update all rates in this namespace
+                                                    this._updateRatesForKeyspaceForRange(keyspaces[i].name, null, yestedayTxt);
+                                                // else, check if some might be missing
                                                 } else {
-                                                    ratesWriting = true;
+                                                    // get today's date minus one day
+                                                    let yestedayTxt = this._getYesterdayDateTxt();
+                                                    // get last rates written dates
+                                                    let lastRatesWritten = keyspaces[i].lastRatesWritten;
+                                                    // if some days are missing
+                                                    if(yestedayTxt!=lastRatesWritten) {
+                                                        // call the function to update rates in this namespace
+                                                        this._updateRatesForKeyspaceForRange(keyspaces[i].name, lastRatesWritten, yestedayTxt);
+                                                    }
                                                 }
-                                            }
-                                            // if the lock is set for the keyspace
-                                            if(ratesWriting==true) {
-                                                // return and ignore the rate writing part
                                                 processingDoneCallback();
                                                 return;
-                                            }
-                                            // if rates were not set
-                                            if(keyspaces[i].hasOwnProperty("lastRatesWritten")==false) {
-                                                // get yesterdays date in YYYY-MM-DD format
-                                                let yestedayTxt = this._getYesterdayDateTxt();
-                                                // call the function to update all rates in this namespace
-                                                this._updateRatesForKeyspaceForRange(keyspaces[i].name, null, yestedayTxt);
-                                            // else, check if some might be missing
-                                            } else {
-                                                // get today's date minus one day
-                                                let yestedayTxt = this._getYesterdayDateTxt();
-                                                // get last rates written dates
-                                                let lastRatesWritten = keyspaces[i].lastRatesWritten;
-                                                // if some days are missing
-                                                if(yestedayTxt!=lastRatesWritten) {
-                                                    // call the function to update rates in this namespace
-                                                    this._updateRatesForKeyspaceForRange(keyspaces[i].name, lastRatesWritten, yestedayTxt);
-                                                }
-                                            }
-                                            processingDoneCallback();
-                                            return;
+                                            }).catch(this._logErrors);
                                         }).catch(this._logErrors);
-                                    }).catch(this._logErrors);
+                                    }
                                 }
-                            }
+                            }).catch(this._logErrors);    
                         }).catch(this._logErrors);
                     }).catch(this._logErrors);
                 });
@@ -399,8 +416,8 @@ class MasterRole {
     // This is because the enrich job needs to find origin tx input, and therefore must have all unspent UTXO available (and all block before filled)
     _updateLastFilledBlockAndPopEnrichJobs(keyspaceobj) {
         return new Promise((resolve,reject)=>{
-            // get the list of blocks range filled, no more than the 600 first ones
-            this._redisClient.lrange(""+this._currency.toUpperCase()+"::filled-ranges::"+keyspaceobj.name, "0", "600", (errLR, resLR)=>{
+            // get the list of blocks range filled, no more than the 700 first ones
+            this._redisClient.lrange(""+this._currency.toUpperCase()+"::filled-ranges::"+keyspaceobj.name, "0", "700", (errLR, resLR)=>{
                 // error handling
                 if(errLR) {
                     reject(errLR);
@@ -411,6 +428,8 @@ class MasterRole {
                     resolve();
                     return;
                 }
+                // tick out all the posted enriched jobs that have confirmed termination with this pushed ranges
+                this._;
                 // parse ranges
                 let ranges = [];
                 for(let i=0;i<resLR.length;i++) {
@@ -468,6 +487,7 @@ class MasterRole {
                     jobname = keyspaceobj.name+"::ENRICH_BLOCK_RANGE::"+ranges[i][0]+","+ranges[i][1];
                     // push the job in the redis bulk call objects
                     multi.lpush(this._currency.toUpperCase()+"::jobs::todo", jobname);
+                    multi.rpush(this._currency.toUpperCase()+"::jobs::posted", ""+Date.now()+"::"+jobname);
                 }
 
                 // delete ranges to clear
@@ -841,6 +861,165 @@ class MasterRole {
         this._redisClient.quit();
         this._stopped = true;
         // master will only exit if the entire program does, so no point in cleaning intervals
+    }
+
+    _checkTimedOutJobs() {
+        return new Promise((resolve,reject)=>{
+            // get the list of done jobs
+            // get the list of posted jobs
+            let multi1 = this._redisClient.multi();
+            multi1.lrange(this._currency.toUpperCase()+"::jobs::done", 0, -1);
+            multi1.lrange(this._currency.toUpperCase()+"::jobs::posted", 0, -1);
+            multi1.exec((errEx1, doneAndPostedLists)=>{
+
+                if(errEx1) {
+                    this._logErrors("A redis request failed.");
+                    reject(errEx1);
+                    return;
+                }
+
+                // usefull for later
+                let now = Date.now();
+
+                // do nothing if nothing to check
+                if(doneAndPostedLists[1]==null || 
+                  (Array.isArray(doneAndPostedLists[1])==false && doneAndPostedLists[1].length==0)) {
+                    resolve();
+                    return;
+                }
+                // as a remainer for job formats:
+                // in todo list: keyspace::JOB_NAME::firstblock,lastblock
+                // in doing and done lists: keyspace::JOB_NAME::workeridentifier::firstblock,lastblock
+                // in posted list: timestamp::keyspace::JOB_NAME::firstblock,lastblock
+
+                // save a reference to both lists for easier access
+                let postedJobs = doneAndPostedLists[1];
+                let doneJobs = [];
+                let timedoutJobs = [];
+                let toResetJobs = [];
+                // our object to bulk redis calls
+                let delMulti = this._redisClient.multi();
+                if(doneAndPostedLists[0]!=null)doneJobs=doneAndPostedLists[0];
+                // for each posted job
+                for(let i=0;i<postedJobs.length;i++) {
+
+                    let foundAndDeleted = false;
+                    let postedJobSplit = postedJobs[i].split("::");
+                    // for each in the done job
+                    for(let j=0;j<doneJobs.length;j++) {
+                        let doneJobSplit = doneJobs[j].split("::");
+                        // if they match
+                        if((postedJobSplit[1]==doneJobSplit[0]) 
+                        && (postedJobSplit[2]==doneJobSplit[1]) 
+                        && (postedJobSplit[3]==doneJobSplit[3])) {
+                            // queue a job deletion in both lists
+                            delMulti.lrem(this._currency.toUpperCase()+"::jobs::posted",1,postedJobs[i]);
+                            delMulti.lrem(this._currency.toUpperCase()+"::jobs::done",1,doneJobs[j]);
+                            foundAndDeleted=true;
+                            // break out of the for loop
+                            break;
+                        }
+                    }
+                    // if the posted job had no match
+                    if(foundAndDeleted==false) {
+                        // if the job has timed out
+                        if(Math.abs(Number(postedJobSplit[0])-Date.now())>JOB_LIFE_TIMEOUT) {
+                            // put it in the timeout list for later processing
+                            timedoutJobs.push(postedJobs[i]);
+                        }
+                    }
+                }
+                // execute the queued job deletions
+                delMulti.exec((errDM, resDM)=>{
+                    if(errDM) {
+                        reject(errDM);
+                        return;
+                    }
+                    // if timeout list is empty, resolve
+                    if(timedoutJobs.length==0) {
+                        resolve();
+                        return;
+                    }
+                    // if not, get the todo and doing job lists
+                    let listMult = this._redisClient.multi();
+                    listMult.lrange(this._currency.toUpperCase()+"::jobs::todo", 0, -1);
+                    listMult.lrange(this._currency.toUpperCase()+"::jobs::doing", 0, -1);
+                    listMult.exec((errLMul, lists)=>{
+                        if(errLMul) {
+                            reject(errLMul);
+                            return;
+                        }
+                        // give lists easier names
+                        let todo = [];
+                        let doing = [];
+                        if(lists[0]!=null)todo=lists[0];
+                        if(lists[1]!=null)doing=lists[1];
+                        // for each job of the timeout list
+                        for(let i=0;i<timedoutJobs.length;i++) {
+                            // bool to know if it was found
+                            let found = false;
+                            let timedoutJobSplit = timedoutJobs[i].split("::");
+                            // for each job in the todo list
+                            for(let j=0;j<todo.length;j++) {
+                                let todoJobSplit = todo[j].split("::");
+                                // if they match, found=true and break
+                                if((timedoutJobSplit[1]==todoJobSplit[0]) 
+                                && (timedoutJobSplit[2]==todoJobSplit[1]) 
+                                && (timedoutJobSplit[3]==todoJobSplit[2])) {
+                                    found=true;
+                                    break;
+                                }
+                            }
+                            // if found==false
+                            if(found==false) {
+                                // for each job in the doing list
+                                for(let j=0;j<doing.length;j++) {
+                                    let doingJobSplit = doing[j].split("::");
+                                    // if they match, found=true and break
+                                    if((timedoutJobSplit[1]==doingJobSplit[0]) 
+                                    && (timedoutJobSplit[2]==doingJobSplit[1]) 
+                                    && (timedoutJobSplit[3]==doingJobSplit[3])) {
+                                        found=true;
+                                        break;
+                                    }
+                                }
+                            }
+                            // if nothing was found
+                            if(found==false) {
+                                // push this job in the reset list
+                                toResetJobs.push(timedoutJobs[i]);
+                            }
+                        }
+                        // if reset list is empty, resolve
+                        if(toResetJobs.length==0) {
+                            resolve();
+                            return;
+                        }
+                        let repostMult = this._redisClient.multi();
+                        // for each job in the reset list
+                        for(let i=0;i<toResetJobs.length;i++) {
+                            // queue a redis deletion from posted
+                            repostMult.lrem(this._currency.toUpperCase()+"::jobs::posted", 1, toResetJobs[i]);
+                            // queue a redis push in posted with updated timestamp
+                            let splittedResetJob = toResetJobs[i].split("::");
+                            splittedResetJob[0] = String(Date.now());
+                            repostMult.lrem(this._currency.toUpperCase()+"::jobs::posted", 1, toResetJobs[i]);
+                            // queue a push in the todo list
+                            repostMult.lpush(this._currency.toUpperCase()+"::jobs::todo", splittedResetJob[1]+"::"+splittedResetJob[2]+"::"+splittedResetJob[3]);
+                        }
+                        // execute the final call
+                        repostMult.exec((errRP,resRP)=>{
+                            if(errRP) {
+                                reject(errRP);
+                                return;
+                            }
+                            resolve();
+                            return;
+                        });
+                    });
+                });
+            });
+        });
     }
 }
 
