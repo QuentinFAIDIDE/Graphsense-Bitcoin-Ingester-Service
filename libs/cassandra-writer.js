@@ -265,6 +265,27 @@ class CassandraWriter {
         this._jobCassandraIORetryStack = {};
         this._jobDoneCallbacks = {};
         this._jobTxCount = {};
+
+        // we will be dumping this metric to redis
+        // when number > 100000
+        // total is the time in seconds divided by 100000
+        this._cassandraResponseTimes = {
+            "number": 0,
+            "total": 0
+        };
+
+        setInterval(()=>{
+            // interval to dump cassandra response time metrics
+            if(this._cassandraResponseTimes.number>100) {
+                let secperRec = (this._cassandraResponseTimes.total/this._cassandraResponseTimes.number);
+                this._redisClient.publish(this._currency.toUpperCase()+"::metrics", "cassandra-timeout: "+secperRec);
+                this._redisClient.set(this._currency.toUpperCase()+"::metrics::cassandra-timeout", secperRec);
+                this._cassandraResponseTimes = {
+                    "number": 0,
+                    "total": 0
+                };
+            }
+        }, 30000);
     }
 
     prepareForKeyspace(keyspace) {
@@ -870,9 +891,16 @@ class CassandraWriter {
             if(this._jobErrors.hasOwnProperty(jobname)==false || this._jobErrors[jobname].length>0) {
                 return;
             }
+            // for the metrics
+            let requestedAt = Date.now();
             // send the writes
             this._cassandraDrivers[keyspace].batch(queries, {prepare:true}).then(()=>{
                 if(this._jobErrors.hasOwnProperty(jobname)==false)return;
+                // metric checkup
+                let responseTime = Date.now()-requestedAt;
+                this._cassandraResponseTimes.number+=queries.length;
+                this._cassandraResponseTimes.total+=(responseTime/(1000));
+
                 // failure or not, we need to know when all tx have been received to start recovering
                 // hence the count and test
                 this._jobTxCount[jobname].txReceived+=queries.length;

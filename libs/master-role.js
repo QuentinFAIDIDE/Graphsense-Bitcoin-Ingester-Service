@@ -3,7 +3,7 @@ var randomstring = require("randomstring");
 var request =require("request");
 var { CassandraWriter } = require("./cassandra-writer.js");
 
-var MASTER_JOBCHECK_INTERVAL = 20000;
+var MASTER_JOBCHECK_INTERVAL = 30000;
 var CALLROLL_DELAY = 10000;
 var BLOCK_BATCH_SIZE = 100;
 var MIN_RATE_DATE = "2010-10-17";
@@ -18,6 +18,7 @@ var MAX_JOB_TYPE_SPREAD = 1000;
 var MAX_TODO_STACK_LEN = 300;
 
 var RATE_WRITING_LOCK_TIMEOUT = 60000*10;
+
 
 class MasterRole {
     /*
@@ -113,15 +114,24 @@ class MasterRole {
         this._jobCheckInterval = setInterval(()=>{
             this._runJobCheck();
         }, MASTER_JOBCHECK_INTERVAL);
+
+        // logs a redis response time every 5 seconds
+        setInterval(()=>{
+            let timeStart = Date.now();
+            this._redisClient.lrange(this._currency.toUpperCase()+"::metrics-data::redis-timeouts", 0, 1, (errLR, resLR)=>{
+                let timeTaken = Date.now() - timeStart;
+                this._redisClient.lpush(this._currency.toUpperCase()+"::metrics-data::redis-timeouts", ""+timeTaken);
+            });
+        }, 5000);
     }
 
     _runJobCheck() {
+        let startedAt = Date.now();
         this._debug("Master run liveliness probe for workers");
         // are all jobs in the "doing" column have responding workers ?
         this._checkActiveJobLiveliness().then(()=>{
             // get last block available
             this._getLastAvailableBlock().then((maxheight)=>{
-                this._debug("Max height in nodes:"+maxheight);
 
                 // error handling
                 if(maxheight==-1) {
@@ -158,6 +168,11 @@ class MasterRole {
                                             if(errMult) {
                                                 this._logErrors(errMult);
                                             } else {
+                                                // we remove the time to wait for replcia responses to have more accurate metrics
+                                                let timeTaken = Date.now() - startedAt - CALLROLL_DELAY;
+                                                this._redisClient.publish(this._currency.toUpperCase()+"::metrics", "master-routine-time: "+timeTaken);
+                                                this._redisClient.set(this._currency.toUpperCase()+"::metrics::master-routine-time", timeTaken);
+                                                this._updateMetrics();
                                                 this._debug("Succesfully updated monitored keyspaces and dead workers");
                                             }
                                         });
@@ -915,6 +930,9 @@ class MasterRole {
                             // queue a job deletion in both lists
                             delMulti.lrem(this._currency.toUpperCase()+"::jobs::posted",1,postedJobs[i]);
                             delMulti.lrem(this._currency.toUpperCase()+"::jobs::done",1,doneJobs[j]);
+                            // dump metrics if asked for 
+                            let timeTaken = Date.now() - Number(postedJobSplit[0]);
+                            delMulti.lpush(this._currency.toUpperCase()+"::metrics-data::jobTimeout", ""+Date.now()+"::"+postedJobSplit[3]+"::"+timeTaken);
                             foundAndDeleted=true;
                             // break out of the for loop
                             break;
@@ -998,10 +1016,12 @@ class MasterRole {
                         let repostMult = this._redisClient.multi();
                         // for each job in the reset list
                         for(let i=0;i<toResetJobs.length;i++) {
+                            let splittedResetJob = toResetJobs[i].split("::");
+                            // increment the timedout job count
+                            repostMult.incr(this._currency.toUpperCase()+"::"+splittedResetJob[1]+"::timedout-jobs");
                             // queue a redis deletion from posted
                             repostMult.lrem(this._currency.toUpperCase()+"::jobs::posted", 1, toResetJobs[i]);
                             // queue a redis push in posted with updated timestamp
-                            let splittedResetJob = toResetJobs[i].split("::");
                             splittedResetJob[0] = String(Date.now());
                             repostMult.lrem(this._currency.toUpperCase()+"::jobs::posted", 1, toResetJobs[i]);
                             // queue a push in the todo list
@@ -1018,6 +1038,76 @@ class MasterRole {
                         });
                     });
                 });
+            });
+        });
+    }
+
+    _updateMetrics() {
+        let metricMult1 = this._redisClient.multi();
+        // pop last 100 redis timeouts (shouldn't be more than 6)
+        metricMult1.lpop(this._currency.toUpperCase()+"::metrics-data::redis-timeouts", 100);
+        // execute
+        metricMult1.exec((errMul1, resMul1)=>{
+            if(errMul1) {
+                this._logErrors(errMul1);
+                return;
+            }
+
+            // second bulk of redis calls
+            let metricMult2 = this._redisClient.multi();
+            // set references for easier code reading
+            let redisResponseTimes = [];
+            if(resMul1[0]!=null) {
+                redisResponseTimes = resMul1[0];
+            }
+            let jobsProcessingTimesLength = resMul1[1];
+            // compute average rate of redis timeouts
+            let avgRedis = 0;
+            for(let i=0;i<redisResponseTimes.length;i++) {
+                avgRedis+=Number(redisResponseTimes[i]);
+            }
+            avgRedis = avgRedis/redisResponseTimes.length;
+            metricMult2.set(this._currency.toUpperCase()+"::metrics::redis-timeout", avgRedis);
+            this._redisClient.publish(this._currency.toUpperCase()+"::metrics", "redis-timeout: "+avgRedis);
+
+            // get all job processing times if worth it
+            metricMult2.lrange(this._currency.toUpperCase()+"::metrics-data::jobTimeout", 0, -1);
+
+            metricMult2.exec((errMul2, resMul2)=>{
+                if(errMul2) {
+                    this._logErrors(errMul2);
+                    return;
+                }
+
+                // compute average job time and average block time if needed (see last if before mult2 exec)
+                if(resMul2[1]!=null && resMul2[1].length!=0) {
+                    let avgJobTime=0;
+                    let avgBlockTime=0;
+                    let blocks=0;
+                    for(let i=0;i<resMul2[1].length;i++) {
+                        console.log(resMul2[1][i]);
+                        let range = resMul2[1][i].split("::")[1].split(",");
+                        blocks+=(Number(range[1])-Number(range[0]));
+                        avgJobTime += Number(resMul2[1][i].split("::")[2]);
+                    }
+                    avgBlockTime = avgJobTime/blocks;
+                    avgJobTime = avgJobTime/resMul2[1].length;
+                
+                    let metricsMult3 = this._redisClient.multi();
+                    metricsMult3.publish(this._currency.toUpperCase()+"::metrics", "avg-job-time: "+avgJobTime);
+                    metricsMult3.publish(this._currency.toUpperCase()+"::metrics", "avg-block-time: "+avgBlockTime);
+                    metricsMult3.set(this._currency.toUpperCase()+"::metrics::avg-job-time", avgJobTime);
+                    metricsMult3.set(this._currency.toUpperCase()+"::metrics::avg-block-time", avgBlockTime);
+                    metricsMult3.del(this._currency.toUpperCase()+"::metrics-data::jobTimeout");
+
+                    metricsMult3.exec((errMult3,resMult3)=>{
+                        if(errMult3) {
+                            this._logErrors(errMult3);
+                        }
+                    });
+                } else {
+                    return;
+                }
             });
         });
     }
