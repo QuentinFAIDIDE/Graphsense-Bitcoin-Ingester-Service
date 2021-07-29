@@ -825,9 +825,18 @@ class CassandraWriter {
     }
 
     _manageCassandraErrorsForJob(jobname, err, rows=null, table=null) {
+        this._debug("Shutting down this replica because of cassandra error.");
         let tablemsg = "";
         if(table!=null)tablemsg=" for table "+table;
         this._logErrors("Cassandra error at job "+jobname+tablemsg+":"+err);
+        setTimeout(()=>{
+            process.exit(1);
+            return;
+        },1000);
+        return;
+
+
+
         // if the write was a pending one that hadn't been finished before another failure that cleared job memory
         if(typeof this._jobErrors[jobname] == "undefined") {
             this._debug("Job "+jobname+" received a cassandra error after its termination.");
@@ -843,7 +852,8 @@ class CassandraWriter {
             }
         // if the job has reached maximum allowed write errors, push an error to the stack
         } else {
-            this._jobErrors[jobname].push("FATAL ERROR: cassandra error rate is too high, error recovery stack max size has been reached.");
+            this._jobErrors[jobname].push("FATAL ERROR: cassandra error rate is too high for job "+jobname+", error recovery stack max size has been reached. Terminating the worker.");
+            process.exit(0);
         }
     }
 
@@ -916,7 +926,10 @@ class CassandraWriter {
                     }
                 }
             }).catch((err)=>{
-                if(this._jobErrors.hasOwnProperty(jobname)==false)return;
+                if(this._jobErrors.hasOwnProperty(jobname)==false) {
+                    this._debug("A tx write arrived after too much cassandra errors, ignored.");
+                    return;
+                }
                 this._manageCassandraErrorsForJob(jobname, err, queries, "transaction");
                 this._jobTxCount[jobname].txReceived+=queries.length;
                 if(this._jobTxCount[jobname].txReceived>=this._jobTxCount[jobname].txToWrite) {

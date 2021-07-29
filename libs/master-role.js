@@ -2,7 +2,7 @@ var redis = require("redis");
 var randomstring = require("randomstring");
 var request =require("request");
 var { CassandraWriter } = require("./cassandra-writer.js");
-var quantile = require( 'distributions-normal-quantile' );
+var quantile = require( "distributions-normal-quantile" );
 
 var MASTER_JOBCHECK_INTERVAL = 30000;
 var CALLROLL_DELAY = 10000;
@@ -69,6 +69,7 @@ class MasterRole {
         });
 
         this._workersIds = [];
+        this._workersDelay = [];
 
         this._rateWritingLocks = {};
 
@@ -88,6 +89,11 @@ class MasterRole {
 
         // bool to prevent race condition on exceptional outages
         this._isRunningRoutine = false;
+
+        // used to cache unresponsive workers jobs for trying to reach em again
+        this._unresponsiveWorkerJobs = [];
+
+        this._lastCallRollTime = Date.now();
     }
 
     // PRIVATE METHODS
@@ -102,7 +108,10 @@ class MasterRole {
             if(messageContent[3]=="CALLROLL" && parameters[0]=="response") {
                 // it's indeed ours
                 if(parameters[2]==this._identifier) {
-                    this._workersIds.push(parameters[1]);
+                    this._workersIds.push(parameters[1].trim());
+                    let responsetime = (Date.now()-this._lastCallRollTime);
+                    this._workersDelay.push(responsetime);
+                    this._debug("Replica "+parameters[1].trim()+" took "+responsetime+" ms to reply.");
                 }
             }
         } catch (err) {
@@ -828,8 +837,9 @@ class MasterRole {
         return new Promise((resolve, reject)=>{
             // get the list of responding workers
             this._getActiveWorkers().then((workers)=>{
+                this._debug("workers responding to master: "+JSON.stringify(workers));
                 // get the list of doing jobs
-                this._redisClient.lrange(""+this._currency+"::jobs::doing", 0, -1, (errLR1,resLR1)=>{
+                this._redisClient.lrange(""+this._currency.toUpperCase()+"::jobs::doing", 0, -1, (errLR1,resLR1)=>{
                     // error handling
                     if(errLR1) {
                         reject("REDIS ERROR (LR1): "+errLR1);
@@ -842,6 +852,9 @@ class MasterRole {
                         return;
                     }
 
+                    // we will wait for next call to retry all failing workers
+                    // and we also retry failed workers from previous call to eventually delete em
+
                     let abandonedJobs = [];
 
                     // now we iterate over job 
@@ -849,15 +862,39 @@ class MasterRole {
                         // parse associated worker
                         let id = resLR1[i].split("::")[2];
                         // if its worker has not response to calls
-                        if(workers.includes(id)==false) {
+                        if(workers.includes(id.trim())==false) {
                             // save it to move it later
-                            this._logErrors("Job "+resLR1[i]+" has no responding worker under "+CALLROLL_DELAY+"ms, moving it back to todo list.");
+                            this._logErrors("Job "+resLR1[i]+" has no responding worker under "+CALLROLL_DELAY+"ms, will test workers a second time and eventually clear them.");
                             abandonedJobs.push(resLR1[i]);
                         }
                     }
 
-                    // if we have found no job with dead worker nothing to do
-                    if(abandonedJobs.length==0) {
+                    let jobsToDrop = [];
+                    // for each job previously marked as unresponsive
+                    for(let i=0;i<this._unresponsiveWorkerJobs.length;i++) {
+                        // parse associated worker
+                        let id = this._unresponsiveWorkerJobs[i].split("::")[2];
+                        // if its worker has not response to calls
+                        if(workers.includes(id)==false) {
+                            this._logErrors("Job "+this._unresponsiveWorkerJobs[i]+" failed a second time, dropping job.");
+                            jobsToDrop.push(this._unresponsiveWorkerJobs[i]);
+                        }
+                    }
+
+
+                    let jobsToCheckLater = [];
+
+                    // put only the new failures in the list
+                    for(let i=0;i<abandonedJobs.length;i++) {
+                        if(this._unresponsiveWorkerJobs.includes(abandonedJobs[i])==false) {
+                            jobsToCheckLater.push(abandonedJobs[i]);
+                        }
+                    }
+                    // save the new failures as the ones to check at next turn
+                    this._unresponsiveWorkerJobs = jobsToCheckLater;
+
+                    // if we have found no job with dead worker twice, nothing to do
+                    if(jobsToDrop.length==0) {
                         resolve();
                         return;
                     }
@@ -866,10 +903,13 @@ class MasterRole {
                     let mult = this._redisClient.multi();
 
                     // we must now move blocks with dead workers back to todo list
-                    for(let i=0;i<abandonedJobs.length;i++) {
-                        this._logErrors("Moving back orphaned job to todo list: "+abandonedJobs[i]);
-                        mult.lrem(""+this._currency+"::jobs::doing", 1, abandonedJobs[i]);
+                    for(let i=0;i<jobsToDrop.length;i++) {
+                        this._logErrors("Moving back orphaned job to todo list: "+jobsToDrop[i]);
+                        mult.lrem(""+this._currency+"::jobs::doing", 1, jobsToDrop[i]);
                     }
+
+                    // get the list of posted jobs to update the dates
+                    mult.lrange(this._currency.toUpperCase()+"::posted", 0, -1);
 
                     mult.exec((errMult,resMult)=>{
                         if(errMult) {
@@ -881,9 +921,23 @@ class MasterRole {
                         let mult2 = this._redisClient.multi();
 
                         // remove worker id and push
-                        for(let i=0;i<abandonedJobs.length;i++) {
-                            let splittedJob = abandonedJobs[i].split("::");
-                            mult2.lpush(""+this._currency+"::jobs::todo", ""+splittedJob[0]+"::"+splittedJob[1]+"::"+splittedJob[3]);
+                        for(let i=0;i<jobsToDrop.length;i++) {
+                            let splittedJob = jobsToDrop[i].split("::");
+                            mult2.lpush(""+this._currency.toUpperCase()+"::jobs::todo", ""+splittedJob[0]+"::"+splittedJob[1]+"::"+splittedJob[3]);
+                            // send pub/sub message to kill unresponsive replica
+                            this._sendMessage("KILL", splittedJob[2]);
+                            // now try to find the posted job to update its timeout
+                            for(let j=0;j<resMult[resMult.length-1].length;j++) {
+                                let splittedPostedJob = resMult[resMult.length-1][j].split("::");
+                                if(splittedJob[0]==splittedPostedJob[1] &&
+                                   splittedJob[1]==splittedPostedJob[2] &&
+                                   splittedJob[3]==splittedPostedJob[3]) {
+                                    // first remove it 
+                                    mult2.lrem(this._currency.toUpperCase()+"::jobs::posted", 1, resMult[resMult.length-1][j]);
+                                    mult2.lpush(this._currency.toUpperCase()+"::jobs::posted", ""+Date.now()+"::"+splittedJob[0]+"::"+splittedJob[1]+"::"+splittedJob[3]);
+                                    break;
+                                }
+                            }
                         }
 
                         // execute the final mult
@@ -904,8 +958,11 @@ class MasterRole {
         return new Promise((resolve, reject)=>{
             // reset the array that store workers ids
             this._workersIds = [];
+            this._workersDelay = [];
             // send a ping message
             this._sendMessage("CALLROLL", "request");
+            this._debug("Sending a callroll as master");
+            this._lastCallRollTime = Date.now();
             // wait for responses
             setTimeout(()=>{
                 resolve(this._workersIds);
@@ -1089,6 +1146,8 @@ class MasterRole {
                             repostMult.lpush(this._currency.toUpperCase()+"::jobs::todo", splittedResetJob[1]+"::"+splittedResetJob[2]+"::"+splittedResetJob[3]);
                             // timeout warning
                             this._logErrors("A job has timed out and has been reset: "+toResetJobs[i]);
+                            // report the job with updated timeout
+                            repostMult.lpush(this._currency.toUpperCase()+"::jobs::posted", splittedResetJob.join("::"));
                         }
                         // remove old ones from todo and doing
                         for(let i=0;i<toClear.length;i++) {
