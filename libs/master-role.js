@@ -161,17 +161,9 @@ class MasterRole {
     }
 
     _scaleBlockRange() {
+        // this feature was disable due to the delay between currently measured block rate and the one in the future when it will get exec
+        // instead, we are scaling with predefined sizes based on height of generated job
         return;
-        let mu = 0;
-        for(let i=0;i<this._lastBlockSpeeds.length;i++) {
-            mu += this._lastBlockSpeeds[i];
-        }
-        mu = mu/this._lastBlockSpeeds.length;
-        let range = Math.ceil(JOB_DESIRED_TIME / mu); 
-        if(range>=1) {
-            this._blockRange = range;
-        }
-        this._redisClient.publish(this._currency.toUpperCase()+"::metrics", "jobRangeSize: "+this._blockRange);
     }
 
     _runJobCheck() {

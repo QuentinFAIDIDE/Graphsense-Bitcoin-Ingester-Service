@@ -1,5 +1,5 @@
 # Bitcoin Ingester Service
-Micro-services that ingest Bitcoin blocks and transactions data in Cassandra following the Graphsense cql schemas.
+Micro-services that ingest Bitcoin blocks and transactions data in Cassandra following the Graphsense cql schemas (Work in Progress).
 
 
 This software is still in early alpha, many features are missing. Also, it is not an official graphsense project.
