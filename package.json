@@ -14,6 +14,7 @@
   "dependencies": {
     "concurrent-queue": "^7.0.2",
     "csv-string": "^4.0.1",
+    "distributions-normal-quantile": "^0.0.0",
     "eslint": "^4.19.1",
     "express-cassandra": "^2.6.0",
     "google-closure-library": "^20210601.0.0",

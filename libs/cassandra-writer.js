@@ -276,7 +276,7 @@ class CassandraWriter {
 
         setInterval(()=>{
             // interval to dump cassandra response time metrics
-            if(this._cassandraResponseTimes.number>100) {
+            if(this._cassandraResponseTimes.number>1000) {
                 let secperRec = (this._cassandraResponseTimes.total/this._cassandraResponseTimes.number);
                 this._redisClient.publish(this._currency.toUpperCase()+"::metrics", "cassandra-timeout: "+secperRec);
                 this._redisClient.set(this._currency.toUpperCase()+"::metrics::cassandra-timeout", secperRec);
@@ -436,7 +436,6 @@ class CassandraWriter {
             
             // if we have no tx, just skip to next block
             if(resMul[0]==null || (Array.isArray(resMul[0]) && resMul[0].length==0)) {
-                this._debug("Block "+String(Number(firstblock)+i)+" was empty for job:"+jobname);
                 // if we are done
                 if((i+1)>=this._totalBlocksPerJob[jobname]) {
                     // we can recover errors and terminate
@@ -826,7 +825,9 @@ class CassandraWriter {
     }
 
     _manageCassandraErrorsForJob(jobname, err, rows=null, table=null) {
-        this._logErrors("Cassandra error at write:"+err);
+        let tablemsg = "";
+        if(table!=null)tablemsg=" for table "+table;
+        this._logErrors("Cassandra error at job "+jobname+tablemsg+":"+err);
         // if the write was a pending one that hadn't been finished before another failure that cleared job memory
         if(typeof this._jobErrors[jobname] == "undefined") {
             this._debug("Job "+jobname+" received a cassandra error after its termination.");

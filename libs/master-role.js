@@ -2,23 +2,32 @@ var redis = require("redis");
 var randomstring = require("randomstring");
 var request =require("request");
 var { CassandraWriter } = require("./cassandra-writer.js");
+var quantile = require( 'distributions-normal-quantile' );
 
 var MASTER_JOBCHECK_INTERVAL = 30000;
 var CALLROLL_DELAY = 10000;
 var BLOCK_BATCH_SIZE = 100;
 var MIN_RATE_DATE = "2010-10-17";
 
-// the maximum time a job can be in the todo queue before checking its exitence in todo and doing queues
-var JOB_LIFE_TIMEOUT = 60000*30;
+
 
 // the maximum number of jobs in the filled range stack before refusing to put further filling jobs
 // todo: implement that
-var MAX_JOB_TYPE_SPREAD = 1000;
+var MAX_FILL_ENRICH_SPREAD = 1000;
 
-var MAX_TODO_STACK_LEN = 300;
+var MAX_TODO_STACK_LEN = 150;
 
 var RATE_WRITING_LOCK_TIMEOUT = 60000*10;
 
+
+// the min height for us to start scaling size of ingested ranges
+var DEFAULT_JOB_RANGE = 50;
+// desired time for a job to spend in queue (that we will try to enforce)
+var JOB_DESIRED_TIME = 60000*2;
+// the maximum time a job can be in the todo queue before clearing it
+var JOB_LIFE_TIMEOUT = 60000*10;
+
+var MAXIMUM_MASTER_CHECK_TIME = 7*60000;
 
 class MasterRole {
     /*
@@ -70,6 +79,15 @@ class MasterRole {
         // per keyspace list of submitted jobs with dates used to check for timeout (lost ones)
         this._fillingJobsQueued = {};
         this._enrichJobsQueued = {};
+
+        // list of last block speed to average to help scale job sizes
+        this._lastBlockSpeeds = [];
+
+        // the size of the range we ingest per job
+        this._blockRange = DEFAULT_JOB_RANGE;
+
+        // bool to prevent race condition on exceptional outages
+        this._isRunningRoutine = false;
     }
 
     // PRIVATE METHODS
@@ -82,7 +100,10 @@ class MasterRole {
             let parameters = messageContent[4].split(",");
             // if someone is responding to a call roll
             if(messageContent[3]=="CALLROLL" && parameters[0]=="response") {
-                this._workersIds.push(parameters[1]);
+                // it's indeed ours
+                if(parameters[2]==this._identifier) {
+                    this._workersIds.push(parameters[1]);
+                }
             }
         } catch (err) {
             this._logErrors(
@@ -115,17 +136,42 @@ class MasterRole {
             this._runJobCheck();
         }, MASTER_JOBCHECK_INTERVAL);
 
-        // logs a redis response time every 5 seconds
+        // logs a redis response time every 5 seconds, and check if the master routines are still executing
         setInterval(()=>{
             let timeStart = Date.now();
             this._redisClient.lrange(this._currency.toUpperCase()+"::metrics-data::redis-timeouts", 0, 1, (errLR, resLR)=>{
                 let timeTaken = Date.now() - timeStart;
                 this._redisClient.lpush(this._currency.toUpperCase()+"::metrics-data::redis-timeouts", ""+timeTaken);
             });
+            // kill this master if its routines are in an obvious blocked state
+            if(this._lastMasterCheckupDate!=0 && (Date.now()-this._lastMasterCheckupDate)>MAXIMUM_MASTER_CHECK_TIME ) {
+                this._logErrors("Last master check was too long ago, dropping this master for a new one.");
+                process.exit(1);
+            }
         }, 5000);
     }
 
+    _scaleBlockRange() {
+        return;
+        let mu = 0;
+        for(let i=0;i<this._lastBlockSpeeds.length;i++) {
+            mu += this._lastBlockSpeeds[i];
+        }
+        mu = mu/this._lastBlockSpeeds.length;
+        let range = Math.ceil(JOB_DESIRED_TIME / mu); 
+        if(range>=1) {
+            this._blockRange = range;
+        }
+        this._redisClient.publish(this._currency.toUpperCase()+"::metrics", "jobRangeSize: "+this._blockRange);
+    }
+
     _runJobCheck() {
+        // help prevents race conditions
+        if(this._isRunningRoutine==true) {
+            return;
+        } else {
+            this._isRunningRoutine=true;
+        }
         let startedAt = Date.now();
         this._debug("Master run liveliness probe for workers");
         // are all jobs in the "doing" column have responding workers ?
@@ -137,11 +183,13 @@ class MasterRole {
                 if(maxheight==-1) {
                     // error was already logged
                     // simply returning
+                    this._isRunningRoutine=false;
                     return;
                 }
                 
                 this._redisClient.llen(""+this._currency.toUpperCase()+"::jobs::todo", (errLLE, todoStackLength)=>{
                     if(errLLE) {
+                        this._isRunningRoutine=false;
                         this._logErrors(errLLE);
                         return;
                     }
@@ -153,6 +201,9 @@ class MasterRole {
 
                             // check the list of posted jobs to delete those who are done and check the timed outs
                             this._checkTimedOutJobs().then(()=>{
+
+
+                                this._lastMasterCheckupDate=Date.now();
 
                                 let totalNbKeyspaces = keyspaces.length;
                                 let processedKeyspaces = 0;
@@ -167,19 +218,25 @@ class MasterRole {
                                         mult.exec((errMult, resMult)=>{
                                             if(errMult) {
                                                 this._logErrors(errMult);
-                                            } else {
-                                                // we remove the time to wait for replcia responses to have more accurate metrics
-                                                let timeTaken = Date.now() - startedAt - CALLROLL_DELAY;
-                                                this._redisClient.publish(this._currency.toUpperCase()+"::metrics", "master-routine-time: "+timeTaken);
-                                                this._redisClient.set(this._currency.toUpperCase()+"::metrics::master-routine-time", timeTaken);
-                                                this._updateMetrics();
-                                                this._debug("Succesfully updated monitored keyspaces and dead workers");
                                             }
+                                            // we remove the time to wait for replcia responses to have more accurate metrics
+                                            let timeTaken = Date.now() - startedAt - CALLROLL_DELAY;
+                                            this._redisClient.publish(this._currency.toUpperCase()+"::metrics", "master-routine-time: "+timeTaken);
+                                            this._redisClient.set(this._currency.toUpperCase()+"::metrics::master-routine-time", timeTaken);
+                                            this._updateMetrics();
+                                            this._debug("Succesfully updated monitored keyspaces and dead workers");
+                                            this._isRunningRoutine=false;
                                         });
                                     }
                                 };
 
                                 this._debug("Keyspaces monitored found: "+JSON.stringify(keyspaces));
+
+                                // terminate if nothing to check
+                                if(keyspaces.length==0) {
+                                    processingDoneCallback();
+                                    return;
+                                }
 
                                 // for each one, if it has been marked as to update continously
                                 for(let i=0; i<keyspaces.length;i++) {
@@ -202,14 +259,15 @@ class MasterRole {
                                                     // push a job for the new block
                                                     let range = [Number(keyspaces[i].lastQueuedBlock)+1 ,Number(maxheight) - Number(keyspaces[i].delay)];
                                                     
-                                                    let jobname = keyspaces[i].name+"::FILL_BLOCK_RANGE::"+range[0]+","+range[1];
+                                                    let jobname;
 
                                                     let tasksPending = todoStackLength;
                                             
                                                     // split job into subtask of blck size
                                                     let furthest_block_sent = Number(range[0]-1);
                                                     let end = Number(range[1]);
-                                                    let split_size = BLOCK_BATCH_SIZE;
+                                                    // update to appropriate split size
+                                                    let split_size = this._rangeSizeForHeight(furthest_block_sent+1);
                                                     while ((furthest_block_sent + split_size) <= end && tasksPending<MAX_TODO_STACK_LEN) {
                                                         tasksPending++;
                                                         // sending job for subrange
@@ -220,6 +278,9 @@ class MasterRole {
                                                         mult.rpush(this._currency.toUpperCase()+"::jobs::posted", ""+Date.now()+"::"+jobname);
                                                         // increment to next batch
                                                         furthest_block_sent += split_size;
+
+                                                        // update split size
+                                                        split_size = this._rangeSizeForHeight(furthest_block_sent+1);
                                                     }
 
                                                     // if there is a remainder, send it as well
@@ -274,16 +335,16 @@ class MasterRole {
                                                 }
                                                 processingDoneCallback();
                                                 return;
-                                            }).catch(this._logErrors);
-                                        }).catch(this._logErrors);
+                                            }).catch((err)=>{this._logErrors(err);this._isRunningRoutine=false;});
+                                        }).catch((err)=>{this._logErrors(err);this._isRunningRoutine=false;});
                                     }
                                 }
-                            }).catch(this._logErrors);    
-                        }).catch(this._logErrors);
-                    }).catch(this._logErrors);
+                            }).catch((err)=>{this._logErrors(err);this._isRunningRoutine=false;});
+                        }).catch((err)=>{this._logErrors(err);this._isRunningRoutine=false;});
+                    }).catch((err)=>{this._logErrors(err);this._isRunningRoutine=false;});
                 });
-            }).catch(this._logErrors);
-        }).catch(this._logErrors);
+            }).catch((err)=>{this._logErrors(err);this._isRunningRoutine=false;});
+        }).catch((err)=>{this._logErrors(err);this._isRunningRoutine=false;});
     }
 
     // simply returns yesterday's date in a YYYY-MM-DD format
@@ -508,6 +569,7 @@ class MasterRole {
                 // delete ranges to clear
                 for(let i=0;i<ranges_to_clear.length;i++) {
                     multi.lrem(""+this._currency.toUpperCase()+"::filled-ranges::"+keyspaceobj.name, 1, ranges_to_clear[i][0]+","+ranges_to_clear[i][1]);
+                    this._logErrors("Cleared duplicated range for filling: "+ranges_to_clear[i][0]+","+ranges_to_clear[i][1]);
                 }
 
                 // let's now update the lastFilledBlock variable
@@ -671,6 +733,7 @@ class MasterRole {
                 // let's also delete rabges that potential race condition caused
                 for(let i=0;i<ranges_to_clear.length;i++) {
                     multi.lrem(""+this._currency.toUpperCase()+"::"+keyspaceobj.name+"::enriched-ranges", 1, ""+ranges_to_clear[i][0]+","+ranges_to_clear[i][1]);
+                    this._logErrors("Cleared duplicated range for enrichment: "+ranges_to_clear[i][0]+","+ranges_to_clear[i][1]);
                 }
 
                 multi.exec((errMUL1, resMUL1)=>{
@@ -719,6 +782,9 @@ class MasterRole {
                         this._cassandraWriter.writeKeyspaceStatistics(keyspaceobj.name, block_count, tx_count);
                         // do not wait for cassandra writes, just return at this point
                         resolve();
+                        // drop a few metrics
+                        this._redisClient.publish(this._currency.toUpperCase()+"::metrics", "lasEnrichedBlock: "+lastEnrichedBlock);
+                        this._redisClient.publish(this._currency.toUpperCase()+"::metrics", "blocksInCassandra: "+block_count);
                         return;
                     });
                 });
@@ -801,7 +867,7 @@ class MasterRole {
 
                     // we must now move blocks with dead workers back to todo list
                     for(let i=0;i<abandonedJobs.length;i++) {
-                        this._debug("Moving back orphaned job to todo list: "+abandonedJobs[i]);
+                        this._logErrors("Moving back orphaned job to todo list: "+abandonedJobs[i]);
                         mult.lrem(""+this._currency+"::jobs::doing", 1, abandonedJobs[i]);
                     }
 
@@ -893,9 +959,6 @@ class MasterRole {
                     return;
                 }
 
-                // usefull for later
-                let now = Date.now();
-
                 // do nothing if nothing to check
                 if(doneAndPostedLists[1]==null || 
                   (Array.isArray(doneAndPostedLists[1])==false && doneAndPostedLists[1].length==0)) {
@@ -968,64 +1031,72 @@ class MasterRole {
                             return;
                         }
                         // give lists easier names
+
+                        let toClear = [];
+
                         let todo = [];
                         let doing = [];
                         if(lists[0]!=null)todo=lists[0];
                         if(lists[1]!=null)doing=lists[1];
                         // for each job of the timeout list
                         for(let i=0;i<timedoutJobs.length;i++) {
-                            // bool to know if it was found
-                            let found = false;
                             let timedoutJobSplit = timedoutJobs[i].split("::");
-                            // for each job in the todo list
-                            for(let j=0;j<todo.length;j++) {
-                                let todoJobSplit = todo[j].split("::");
+
+                            // for each job in the doing list
+                            for(let j=0;j<doing.length;j++) {
+                                let doingJobSplit = doing[j].split("::");
                                 // if they match, found=true and break
-                                if((timedoutJobSplit[1]==todoJobSplit[0]) 
-                                && (timedoutJobSplit[2]==todoJobSplit[1]) 
-                                && (timedoutJobSplit[3]==todoJobSplit[2])) {
-                                    found=true;
+                                if((timedoutJobSplit[1]==doingJobSplit[0]) 
+                                && (timedoutJobSplit[2]==doingJobSplit[1]) 
+                                && (timedoutJobSplit[3]==doingJobSplit[3])) {
+                                    // send a signal to kill its worker 
+                                    /* message is formatted as so: "[TIMESTAMP]::[IDENTIFIER_EMITTER]::[ACTION]::[PARAMETER1,PARAMETER2,etc..]*/
+                                    // action is KILL, with parameter as the workerId
+                                    let workerId = doingJobSplit[2];
+                                    // the helper that format the message as above
+                                    this._sendMessage("KILL", workerId);
+                                    toClear.push({type:"doing",job:doing[j]});
                                     break;
                                 }
                             }
-                            // if found==false
-                            if(found==false) {
-                                // for each job in the doing list
-                                for(let j=0;j<doing.length;j++) {
-                                    let doingJobSplit = doing[j].split("::");
-                                    // if they match, found=true and break
-                                    if((timedoutJobSplit[1]==doingJobSplit[0]) 
-                                    && (timedoutJobSplit[2]==doingJobSplit[1]) 
-                                    && (timedoutJobSplit[3]==doingJobSplit[3])) {
-                                        found=true;
-                                        break;
-                                    }
+
+                            // for each job in the todo list
+                            for(let j=0;j<todo.length;j++) {
+                                let todoJobSplit = todo[j].split("::");
+                                // if they match and break
+                                if((timedoutJobSplit[1]==todoJobSplit[0]) 
+                                && (timedoutJobSplit[2]==todoJobSplit[1]) 
+                                && (timedoutJobSplit[3]==todoJobSplit[2])) {
+                                    toClear.push({type:"todo", job:todo[j]});
+                                    break;
                                 }
                             }
-                            // if nothing was found
-                            if(found==false) {
-                                // push this job in the reset list
-                                toResetJobs.push(timedoutJobs[i]);
-                            }
-                        }
-                        // if reset list is empty, resolve
-                        if(toResetJobs.length==0) {
-                            resolve();
-                            return;
+
+                            // push this job in the reset list
+                            toResetJobs.push(timedoutJobs[i]);
                         }
                         let repostMult = this._redisClient.multi();
                         // for each job in the reset list
                         for(let i=0;i<toResetJobs.length;i++) {
                             let splittedResetJob = toResetJobs[i].split("::");
-                            // increment the timedout job count
+                            // increment the timedout job count (for this keyspace)
                             repostMult.incr(this._currency.toUpperCase()+"::"+splittedResetJob[1]+"::timedout-jobs");
-                            // queue a redis deletion from posted
+                            // queue a redis deletion from posted list (we replace it here)
                             repostMult.lrem(this._currency.toUpperCase()+"::jobs::posted", 1, toResetJobs[i]);
                             // queue a redis push in posted with updated timestamp
                             splittedResetJob[0] = String(Date.now());
-                            repostMult.lrem(this._currency.toUpperCase()+"::jobs::posted", 1, toResetJobs[i]);
-                            // queue a push in the todo list
+                            // queue a new job push in the todo list
                             repostMult.lpush(this._currency.toUpperCase()+"::jobs::todo", splittedResetJob[1]+"::"+splittedResetJob[2]+"::"+splittedResetJob[3]);
+                            // timeout warning
+                            this._logErrors("A job has timed out and has been reset: "+toResetJobs[i]);
+                        }
+                        // remove old ones from todo and doing
+                        for(let i=0;i<toClear.length;i++) {
+                            if(toClear[i].type=="todo") {
+                                repostMult.lrem(this._currency.toUpperCase()+"::jobs::todo", 1, toClear[i].job);
+                            } else if(toClear[i].type=="doing") {
+                                repostMult.lrem(this._currency.toUpperCase()+"::jobs::doing", 1, toClear[i].job);
+                            }
                         }
                         // execute the final call
                         repostMult.exec((errRP,resRP)=>{
@@ -1070,7 +1141,7 @@ class MasterRole {
             metricMult2.set(this._currency.toUpperCase()+"::metrics::redis-timeout", avgRedis);
             this._redisClient.publish(this._currency.toUpperCase()+"::metrics", "redis-timeout: "+avgRedis);
 
-            // get all job processing times if worth it
+            // get all job processing times
             metricMult2.lrange(this._currency.toUpperCase()+"::metrics-data::jobTimeout", 0, -1);
 
             metricMult2.exec((errMul2, resMul2)=>{
@@ -1085,7 +1156,6 @@ class MasterRole {
                     let avgBlockTime=0;
                     let blocks=0;
                     for(let i=0;i<resMul2[1].length;i++) {
-                        console.log(resMul2[1][i]);
                         let range = resMul2[1][i].split("::")[1].split(",");
                         blocks+=(Number(range[1])-Number(range[0]));
                         avgJobTime += Number(resMul2[1][i].split("::")[2]);
@@ -1100,6 +1170,16 @@ class MasterRole {
                     metricsMult3.set(this._currency.toUpperCase()+"::metrics::avg-block-time", avgBlockTime);
                     metricsMult3.del(this._currency.toUpperCase()+"::metrics-data::jobTimeout");
 
+                    // push the average job time and trigger range adaptation if enought data
+                    // 10 is the moving average size used = 5 minutes of master running
+                    this._lastBlockSpeeds.push(avgBlockTime);
+                    if(this._lastBlockSpeeds.length>0) {
+                        if(this._lastBlockSpeeds.length>4) {
+                            this._lastBlockSpeeds.shift();
+                        }
+                        this._scaleBlockRange();
+                    }
+
                     metricsMult3.exec((errMult3,resMult3)=>{
                         if(errMult3) {
                             this._logErrors(errMult3);
@@ -1110,6 +1190,24 @@ class MasterRole {
                 }
             });
         });
+    }
+
+    _rangeSizeForHeight(height) {
+        if(height<150000) {
+            return 2000;
+        } else if (height<180000) {
+            return 1000;
+        } else if (height<230000) {
+            return 200;
+        } else if (height<300000) {
+            return 100;
+        } else if (height<400000) {
+            return 50;
+        } else if (height<500000) {
+            return 10;
+        } else {
+            return 10;
+        }
     }
 }
 
