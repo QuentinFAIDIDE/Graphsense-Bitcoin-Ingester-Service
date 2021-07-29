@@ -66,7 +66,7 @@ class WorkerRole {
 
     // PRIVATE METHODS
     /* act on received messages on the redis channel for replicas scheduling */
-    /* message is formatted as so: "[TIMESTAMP]::[IDENTIFIER_EMITTER]::[ACTION]::[PARAMETER1,PARAMETER2,etc..]*/
+    /* message is formatted as so: "[CURRENCY]::[TIMESTAMP]::[IDENTIFIER_EMITTER]::[ACTION]::[PARAMETER1,PARAMETER2,etc..]*/
     _parseChannelMessage(msg) {
         try {
             // parsing the message parameters
@@ -75,13 +75,13 @@ class WorkerRole {
             // if someone is running a CALLROLL
             if(messageContent[3]=="CALLROLL" && parameters[0]=="request") {
                 // reply with a message signaling we are alive
-                this._sendMessage("CALLROLL", "response,"+this._identifier+","+parameters[1]);
+                this._sendMessage("CALLROLL", "response,"+this._identifier+","+messageContent[2]);
             // if someone is replying to a healthcheck
             } else if(messageContent[3]=="KILL") {
                 // if we are the target
-                if(parameters[0]==this._identifer) {
+                if(parameters[0]==this._identifier) {
                     // kill the process
-                    this._logMessage("Worker: another replica running a CALLROLL asked us to stop running service");
+                    this._logMessage("Worker: A master running a CALLROLL asked us to stop running service");
                     process.exit(0);
                 }
             }

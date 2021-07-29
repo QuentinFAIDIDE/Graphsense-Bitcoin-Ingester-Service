@@ -4,7 +4,7 @@
 
 // import utilitaries
 var { checkRequiredEnVar } = require("./libs/utils.js");
-
+var randomstring = require("randomstring");
 // ENVIRONMENT VARIABLES
 // redis configuration
 var REDIS_HOST = process.env.REDIS_HOST;
@@ -50,12 +50,22 @@ const { ReplicaScheduler } = require("./libs/replica-scheduler.js");
 const { MasterRole } = require("./libs/master-role.js");
 const { WorkerRole } = require("./libs/worker-role.js");
 
+let logId = randomstring.generate(16);
+
 // detect if debug mode enabled
 var DEBUG_MODE = process.env.DEBUG_MODE;
+var STREAM_DEBUG_LOGS = process.env.STREAM_DEBUG_LOGS; 
 let debugLog = function (log) {};
-if(typeof DEBUG_MODE == "string" || DEBUG_MODE=="true") {
-    debugLog = function (debug) { console.log(""+Date.now()+"(debug): "+debug);};
+if(typeof DEBUG_MODE == "string" && DEBUG_MODE=="true") {
+    debugLog = function (debug) {
+        console.log(""+Date.now()+"(debug): "+debug);
+        if(typeof STREAM_DEBUG_LOGS == "string" && STREAM_DEBUG_LOGS=="true") {
+            redisClient.publish(CURRENCY_SYMBOL+"::debug", ""+Date.now()+"(debug "+logId+"): "+debug);
+        }
+    };
 }
+
+
 
 // message logging function
 var logMessages = function (msg) { console.log(""+Date.now()+": "+msg);};

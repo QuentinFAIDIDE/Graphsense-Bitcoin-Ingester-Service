@@ -276,7 +276,7 @@ class CassandraWriter {
 
         setInterval(()=>{
             // interval to dump cassandra response time metrics
-            if(this._cassandraResponseTimes.number>100) {
+            if(this._cassandraResponseTimes.number>1000) {
                 let secperRec = (this._cassandraResponseTimes.total/this._cassandraResponseTimes.number);
                 this._redisClient.publish(this._currency.toUpperCase()+"::metrics", "cassandra-timeout: "+secperRec);
                 this._redisClient.set(this._currency.toUpperCase()+"::metrics::cassandra-timeout", secperRec);
@@ -436,7 +436,6 @@ class CassandraWriter {
             
             // if we have no tx, just skip to next block
             if(resMul[0]==null || (Array.isArray(resMul[0]) && resMul[0].length==0)) {
-                this._debug("Block "+String(Number(firstblock)+i)+" was empty for job:"+jobname);
                 // if we are done
                 if((i+1)>=this._totalBlocksPerJob[jobname]) {
                     // we can recover errors and terminate
@@ -826,24 +825,18 @@ class CassandraWriter {
     }
 
     _manageCassandraErrorsForJob(jobname, err, rows=null, table=null) {
-        this._logErrors("Cassandra error at write:"+err);
-        // if the write was a pending one that hadn't been finished before another failure that cleared job memory
-        if(typeof this._jobErrors[jobname] == "undefined") {
-            this._debug("Job "+jobname+" received a cassandra error after its termination.");
+        this._debug("Shutting down this replica because of cassandra error.");
+        let tablemsg = "";
+        if(table!=null)tablemsg=" for table "+table;
+        this._logErrors("Cassandra error at job "+jobname+tablemsg+":"+err);
+        setTimeout(()=>{
+            process.exit(1);
             return;
-        }
-        //if the job is still running save the error if we didn't saved too much already
-        if(this._jobCassandraIORetryStack[jobname].count<MAX_RETRY_CASSANDRA) {
-            if(rows!=null) {
-                for(let i=0;i<rows.length;i++) {
-                    this._jobCassandraIORetryStack[jobname][table].push(rows[i]);
-                    this._jobCassandraIORetryStack[jobname].count++;
-                }
-            }
-        // if the job has reached maximum allowed write errors, push an error to the stack
-        } else {
-            this._jobErrors[jobname].push("FATAL ERROR: cassandra error rate is too high, error recovery stack max size has been reached.");
-        }
+        },1000);
+        return;
+        // We used to micro-manage errors with stacks here, but I decided that
+        // killing the replica was doing a better job at reducing risks of 
+        // corrupted internal service states
     }
 
     parseTransaction(keyspace, jobname, txbuffer, garbageCollection=false) {
@@ -915,7 +908,10 @@ class CassandraWriter {
                     }
                 }
             }).catch((err)=>{
-                if(this._jobErrors.hasOwnProperty(jobname)==false)return;
+                if(this._jobErrors.hasOwnProperty(jobname)==false) {
+                    this._debug("A tx write arrived after too much cassandra errors, ignored.");
+                    return;
+                }
                 this._manageCassandraErrorsForJob(jobname, err, queries, "transaction");
                 this._jobTxCount[jobname].txReceived+=queries.length;
                 if(this._jobTxCount[jobname].txReceived>=this._jobTxCount[jobname].txToWrite) {
