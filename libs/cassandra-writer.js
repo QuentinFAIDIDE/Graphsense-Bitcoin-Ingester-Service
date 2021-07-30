@@ -22,6 +22,8 @@ var KEYSPACE_REGEXP = /^[a-z0-9_]{1,48}$/;
 
 var MIN_METRICS_DUMP = 100;
 
+var insert_block_cql = "INSERT INTO block (height, block_hash, no_transactions, timestamp) VALUES (?, ?, ?, ?)";
+
 // environnement variables used here
 var IGNORE_BLOCK_TRANSACTION = process.env.IGNORE_BLOCK_TRANSACTION;
 if(IGNORE_BLOCK_TRANSACTION!="true") {
@@ -173,7 +175,9 @@ class CassandraWriter {
             protocolOptions: {port: process.env.CASSANDRA_PORT},
             keyspace: "mykeyspace",
             localDataCenter: process.env.CASSANDRA_DATACENTER,
-            queryOptions: {consistency: ExpressCassandra.consistencies.one},
+            queryOptions: {
+                consistency: ExpressCassandra.consistencies.one
+            },
             pooling: {maxRequestsPerConnection: 4096},
             socketOptions: {
                 connectTimeout: 60000,
@@ -690,20 +694,15 @@ class CassandraWriter {
                         this._jobTxCount[jobname].blocks_finished = true;
                     }
                 }
-                // create model
-                queries.push( new this._blockModels[keyspace]({
-                    height: blockObj.number,
-                    block_hash: Buffer.from(blockObj.hash, "hex"),
-                    no_transactions: blockObj.transaction_count,
-                    timestamp: blockObj.timestamp
-                }).save({return_query: true}));
+
+                // execute cassandra query
+                this._cassandraDrivers[keyspace].execute(insert_block_cql, [blockObj.number, Buffer.from(blockObj.hash, "hex"),
+                    blockObj.transaction_count, blockObj.timestamp], {prepare: true})
+                    .catch((err)=>{
+                        this._manageCassandraErrorsForJob(jobname, err, queries, "block");
+                    });
             }
         }
-
-        // send the writes
-        this._expressCassandraDrivers[keyspace].doBatch(queries, (err)=>{
-            if(err)this._manageCassandraErrorsForJob(jobname, err, queries, "block");
-        });
     }
 
     // function to format data for the block_transactions table
@@ -886,17 +885,10 @@ class CassandraWriter {
             }
             // for the metrics
             let requestedAt = Date.now();
-            // send the writes
-            this._cassandraDrivers[keyspace].batch(queries, {prepare:true}).then(()=>{
-                if(this._jobErrors.hasOwnProperty(jobname)==false)return;
-                // metric checkup
-                let responseTime = Date.now()-requestedAt;
-                this._cassandraResponseTimes.number+=queries.length;
-                this._cassandraResponseTimes.total+=(responseTime/(1000));
 
-                // failure or not, we need to know when all tx have been received to start recovering
-                // hence the count and test
-                this._jobTxCount[jobname].txReceived+=queries.length;
+            // callback when tx are written
+            let jobTxDoneStateCheck = ()=>{
+                this._jobTxCount[jobname].txReceived++;
                 if(this._jobTxCount[jobname].txReceived>=this._jobTxCount[jobname].txToWrite) {
                     // if all blocks have been received and filled with txs
                     if(this._jobTxCount[jobname].blocks_finished==true) {
@@ -907,24 +899,34 @@ class CassandraWriter {
                         }
                     }
                 }
-            }).catch((err)=>{
-                if(this._jobErrors.hasOwnProperty(jobname)==false) {
-                    this._debug("A tx write arrived after too much cassandra errors, ignored.");
-                    return;
-                }
-                this._manageCassandraErrorsForJob(jobname, err, queries, "transaction");
-                this._jobTxCount[jobname].txReceived+=queries.length;
-                if(this._jobTxCount[jobname].txReceived>=this._jobTxCount[jobname].txToWrite) {
-                    // if all blocks have been received and filled with txs
-                    if(this._jobTxCount[jobname].blocks_finished==true) {
-                        // if all block_transaction rows were written
-                        if(this._writtenBlocksPerJob[jobname]>=this._totalBlocksPerJob[jobname]) {
-                            // start the process of recovering eventual write errors and terminating job
-                            this._recoverFillJobErrors(keyspace, jobname);
+            };
+
+            // we will stop writing in batches because they sometimes are refused for being too big
+
+            // for each query 
+            for(let i=0;i<queries.length;i++) {
+                this._cassandraDrivers[keyspace].execute(push_transaction_query, queries[i].params, {prepare: true})
+                    .then(()=>{
+
+                        if(this._jobErrors.hasOwnProperty(jobname)==false)return;
+                        // metric measuring
+                        let responseTime = Date.now()-requestedAt;
+                        this._cassandraResponseTimes.number++;
+                        this._cassandraResponseTimes.total+=(responseTime/(1000));
+        
+                        // failure or not, we need to know when all tx have been received to start recovering
+                        // hence the count and test
+                        jobTxDoneStateCheck();
+
+                    }).catch((err)=>{
+                        if(this._jobErrors.hasOwnProperty(jobname)==false) {
+                            this._debug("A tx write arrived after too much cassandra errors, ignored.");
+                            return;
                         }
-                    }
-                }
-            });
+                        this._manageCassandraErrorsForJob(jobname, err, queries[i], "transaction");
+                        jobTxDoneStateCheck();
+                    });
+            }
         };
 
         // keep track of the tx to write and written

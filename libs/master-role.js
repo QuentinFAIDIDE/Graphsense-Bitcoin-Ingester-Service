@@ -22,10 +22,8 @@ var RATE_WRITING_LOCK_TIMEOUT = 60000*10;
 
 // the min height for us to start scaling size of ingested ranges
 var DEFAULT_JOB_RANGE = 50;
-// desired time for a job to spend in queue (that we will try to enforce)
-var JOB_DESIRED_TIME = 60000*2;
 // the maximum time a job can be in the todo queue before clearing it
-var JOB_LIFE_TIMEOUT = 60000*10;
+var JOB_LIFE_TIMEOUT = 60000*20;
 
 var MAXIMUM_MASTER_CHECK_TIME = 7*60000;
 
