@@ -488,7 +488,7 @@ class MasterRole {
         });
     }
 
-    // this function get all block range written and update the lastFilledBlock value
+    // this function get all block range "filled", generate a job to "enrich" these ranges and update the lastFilledBlock value
     // The fill job push their range to a list that we read to know what's the last block written that has all previous ones filled
     // This is because the enrich job needs to find origin tx input, and therefore must have all unspent UTXO available (and all block before filled)
     _updateLastFilledBlockAndPopEnrichJobs(keyspaceobj) {
@@ -864,12 +864,15 @@ class MasterRole {
                     let jobsToDrop = [];
                     // for each job previously marked as unresponsive
                     for(let i=0;i<this._unresponsiveWorkerJobs.length;i++) {
-                        // parse associated worker
-                        let id = this._unresponsiveWorkerJobs[i].split("::")[2];
-                        // if its worker has not response to calls
-                        if(workers.includes(id)==false) {
-                            this._logErrors("Job "+this._unresponsiveWorkerJobs[i]+" failed a second time, dropping job.");
-                            jobsToDrop.push(this._unresponsiveWorkerJobs[i]);
+                        // if it is still in the todo list (could have beeen cleared for timing out in between two calls to this function)
+                        if(resLR1.includes(this._unresponsiveWorkerJobs[i])==true) {
+                            // parse associated worker id
+                            let id = this._unresponsiveWorkerJobs[i].split("::")[2];
+                            // if its worker has not response to calls
+                            if(workers.includes(id)==false) {
+                                this._logErrors("Job "+this._unresponsiveWorkerJobs[i]+" failed a second time, dropping job.");
+                                jobsToDrop.push(this._unresponsiveWorkerJobs[i]);
+                            }
                         }
                     }
 
@@ -915,7 +918,6 @@ class MasterRole {
                         // remove worker id and push
                         for(let i=0;i<jobsToDrop.length;i++) {
                             let splittedJob = jobsToDrop[i].split("::");
-                            mult2.lpush(""+this._currency.toUpperCase()+"::jobs::todo", ""+splittedJob[0]+"::"+splittedJob[1]+"::"+splittedJob[3]);
                             // send pub/sub message to kill unresponsive replica
                             this._sendMessage("KILL", splittedJob[2]);
                             // now try to find the posted job to update its timeout
@@ -924,9 +926,11 @@ class MasterRole {
                                 if(splittedJob[0]==splittedPostedJob[1] &&
                                    splittedJob[1]==splittedPostedJob[2] &&
                                    splittedJob[3]==splittedPostedJob[3]) {
-                                    // first remove it 
+                                    // first remove it and repush with updated timestamp
                                     mult2.lrem(this._currency.toUpperCase()+"::jobs::posted", 1, resMult[resMult.length-1][j]);
                                     mult2.lpush(this._currency.toUpperCase()+"::jobs::posted", ""+Date.now()+"::"+splittedJob[0]+"::"+splittedJob[1]+"::"+splittedJob[3]);
+                                    // repush it todo
+                                    mult2.lpush(""+this._currency.toUpperCase()+"::jobs::todo", ""+splittedJob[0]+"::"+splittedJob[1]+"::"+splittedJob[3]);
                                     break;
                                 }
                             }
