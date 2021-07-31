@@ -42,6 +42,10 @@ if(UTXO_CACHE_IS_CLUSTER!="true") {
 
 var UTXO_CACHE_PASSWORD, USE_UTXO_CACHE_PASSWORD;
 
+// detect if redis password setting is used
+var USE_REDIS_PASSWORD = !(typeof process.env.REDIS_PASSWORD == "undefined");
+var REDIS_PASSWORD = process.env.REDIS_PASSWORD;
+
 // if using cache we need flush interval
 var UTXO_CACHE_FLUSH_INTERVAL, UTXO_CACHE_CLUSTER_ENDPOINTS, UTXO_CACHE_HOST, UTXO_CACHE_PORT;
 if(USING_REDIS_UTXO_CACHE=="true") {
@@ -110,8 +114,13 @@ class CassandraWriter {
   */
 
     constructor(redisHost, redisPort, symbol, logMessage, logErrors, debug) {
-        // load a redis instance to increment on the write or save errors
-        this._redisClient = redis.createClient({ port: redisPort, host: redisHost });
+
+        // load a redis instance
+        if(USE_REDIS_PASSWORD==false) {
+            this._redisClient = redis.createClient({ port: redisPort, host: redisHost });
+        } else {
+            this._redisClient = redis.createClient({ port: redisPort, host: redisHost, password: REDIS_PASSWORD });
+        }
 
         // ioredis instance for the UTXO cache if activated
         this._redisUTXoCacheClient = null;

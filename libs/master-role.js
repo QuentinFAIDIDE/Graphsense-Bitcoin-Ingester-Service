@@ -2,7 +2,6 @@ var redis = require("redis");
 var randomstring = require("randomstring");
 var request =require("request");
 var { CassandraWriter } = require("./cassandra-writer.js");
-var quantile = require( "distributions-normal-quantile" );
 
 var MASTER_JOBCHECK_INTERVAL = 30000;
 var CALLROLL_DELAY = 10000;
@@ -23,9 +22,13 @@ var RATE_WRITING_LOCK_TIMEOUT = 60000*10;
 // the min height for us to start scaling size of ingested ranges
 var DEFAULT_JOB_RANGE = 50;
 // the maximum time a job can be in the todo queue before clearing it
-var JOB_LIFE_TIMEOUT = 60000*20;
+var JOB_LIFE_TIMEOUT = 60000*40;
 
 var MAXIMUM_MASTER_CHECK_TIME = 7*60000;
+
+// detect if redis password setting is used
+var USE_REDIS_PASSWORD = !(typeof process.env.REDIS_PASSWORD == "undefined");
+var REDIS_PASSWORD = process.env.REDIS_PASSWORD;
 
 class MasterRole {
     /*
@@ -36,8 +39,13 @@ class MasterRole {
     constructor(redisHost, redisPort, symbol, logMessage, logErrors, debug) {
 
         // create the redis client
-        this._redisClient = redis.createClient({ port: redisPort, host: redisHost });
-        this._subClient = redis.createClient({ port: redisPort, host: redisHost });
+        if(USE_REDIS_PASSWORD==false) {
+            this._redisClient = redis.createClient({ port: redisPort, host: redisHost });
+            this._subClient = redis.createClient({ port: redisPort, host: redisHost });
+        } else {
+            this._redisClient = redis.createClient({ port: redisPort, host: redisHost, password: REDIS_PASSWORD });
+            this._subClient = redis.createClient({ port: redisPort, host: redisHost, password: REDIS_PASSWORD });
+        }
 
         // save important constructor variables
         this._currency = symbol;
@@ -242,6 +250,7 @@ class MasterRole {
 
                                     // ignore the keyspace if it's marked broken
                                     if(Object.prototype.hasOwnProperty.call(keyspaces[i], "broken")==true && keyspaces[i].broken=="true") {
+                                        processingDoneCallback();
                                         continue;
                                     }
 

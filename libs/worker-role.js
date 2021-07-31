@@ -13,6 +13,19 @@ let MAX_JOBS_PER_REPLICA = 1;
 let MAX_FILL_CONCURRENCY = 9;
 let MAX_FILL_CONCURRENCY_PER_NODE = 9;
 
+if(typeof process.env.MAX_FILL_CONCURRENCY_PER_NODE != "undefined") {
+    MAX_FILL_CONCURRENCY_PER_NODE=process.env.MAX_FILL_CONCURRENCY_PER_NODE;
+    if(Number.isNaN(Number(MAX_FILL_CONCURRENCY_PER_NODE))==true 
+    || Number(MAX_FILL_CONCURRENCY_PER_NODE)<1) {
+        this._logErrors("MAX_FILL_CONCURRENCY_PER_NODE invalid");
+        process.exit(1);
+    }
+}
+
+// detect if redis password setting is used
+var USE_REDIS_PASSWORD = !(typeof process.env.REDIS_PASSWORD == "undefined");
+var REDIS_PASSWORD = process.env.REDIS_PASSWORD;
+
 class WorkerRole {
     /*
     Class that implements worker role that all replica have
@@ -24,8 +37,14 @@ class WorkerRole {
         let parentExec = this;
 
         // create the redis client
-        this._redisClient = redis.createClient({ port: redisPort, host: redisHost });
-        this._subClient = redis.createClient({ port: redisPort, host: redisHost });
+        if(USE_REDIS_PASSWORD==false) {
+            this._redisClient = redis.createClient({ port: redisPort, host: redisHost });
+            this._subClient = redis.createClient({ port: redisPort, host: redisHost });
+        } else {
+            this._redisClient = redis.createClient({ port: redisPort, host: redisHost, password: REDIS_PASSWORD });
+            this._subClient = redis.createClient({ port: redisPort, host: redisHost, password: REDIS_PASSWORD });
+        }
+
         
         // save important constructor variables
         this._currency = symbol;
@@ -408,16 +427,18 @@ class WorkerRole {
                                     return;
                                 }
                                 if(err==null) {
-                                    this._moveJobFromDoingToDone(jobname).then(resolve).catch(reject);
-                                    // now let the master know this range is finished
-                                    // (it will test all finished ranges to generate tx enrichment (input inference) jobs)
-                                    this._redisClient.rpush(""+this._currency.toUpperCase()+"::filled-ranges::"+keyspace, 
-                                        ""+minblock+","+maxblock, (errLP, resLP)=>{
-                                            if(errLP) {
-                                                this._logErrors("(REDIS FATAL ERROR) Unable to push to redis filled block stack: "+errLP);
-                                                this._markKeyspaceAsBroken(keyspace);
-                                            }
-                                        });
+                                    this._moveJobFromDoingToDone(jobname).then(()=>{
+                                        resolve();
+                                        // now let the master know this range is finished
+                                        // (it will test all finished ranges to generate tx enrichment (input inference) jobs)
+                                        this._redisClient.rpush(""+this._currency.toUpperCase()+"::filled-ranges::"+keyspace, 
+                                            ""+minblock+","+maxblock, (errLP, resLP)=>{
+                                                if(errLP) {
+                                                    this._logErrors("(REDIS FATAL ERROR) Unable to push to redis filled block stack: "+errLP);
+                                                    this._markKeyspaceAsBroken(keyspace);
+                                                }
+                                            });
+                                    }).catch(reject);
                                 } else {
                                     rejectAndMoveToErrorStack(err);
                                 }
@@ -470,19 +491,20 @@ class WorkerRole {
                         }
                         if(err==null) {
                             // save the job range as done for master to increment keyspace statistics
-                            this._redisClient.rpush(""+this._currency.toUpperCase()+"::"+keyspace+"::enriched-ranges", ""+minblock+","+maxblock,
-                                (errLP2, resLP2)=>{
-                                    if(errLP2) {
-                                    // redis rpush error
-                                        this._logErrors("Failed to write enriched range to redis for master to update statistics");
-                                        rejectAndMoveToErrorStack(err);
-                                        return;
-                                    } else {
-                                    // all good, we can move the job in the done stack
-                                        this._moveJobFromDoingToDone(jobname).then(resolve).catch(reject);
-                                        return;
-                                    }
-                                });
+                            // all good, we can move the job in the done stack
+                            this._moveJobFromDoingToDone(jobname).then(()=>{
+                                this._redisClient.rpush(""+this._currency.toUpperCase()+"::"+keyspace+"::enriched-ranges", ""+minblock+","+maxblock,
+                                    (errLP2, resLP2)=>{
+                                        if(errLP2) {
+                                        // redis rpush error
+                                            this._logErrors("Failed to write enriched range to redis for master to update statistics");
+                                            this._markKeyspaceAsBroken(keyspace);
+                                            return;
+                                        } else {
+                                            resolve();
+                                        }
+                                    });
+                                }).catch(reject);
                         } else {
                             rejectAndMoveToErrorStack(err);
                             return;

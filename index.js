@@ -13,6 +13,9 @@ var REDIS_PORT = process.env.REDIS_PORT;
 checkRequiredEnVar(REDIS_HOST, "REDIS_HOST");
 checkRequiredEnVar(REDIS_PORT, "REDIS_PORT");
 
+var USE_REDIS_PASSWORD = !(typeof process.env.REDIS_PASSWORD == "undefined");
+var REDIS_PASSWORD = process.env.REDIS_PASSWORD;
+
 // currency config
 var CURRENCY_SYMBOL = process.env.CURRENCY_SYMBOL;
 checkRequiredEnVar(CURRENCY_SYMBOL, "CURRENCY_SYMBOL");
@@ -44,7 +47,12 @@ checkRequiredEnVar(CASSANDRA_DATACENTER, "CASSANDRA_DATACENTER");
 
 // connect to the redis instance
 const redis = require("redis");
-var redisClient = redis.createClient({port: REDIS_PORT, host: REDIS_HOST});
+var redisClient;
+if(USE_REDIS_PASSWORD==false) {
+    redisClient = redis.createClient({port: REDIS_PORT, host: REDIS_HOST});
+} else {
+    redisClient = redis.createClient({port: REDIS_PORT, host: REDIS_HOST, password: REDIS_PASSWORD});
+}
 
 const { ReplicaScheduler } = require("./libs/replica-scheduler.js");
 const { MasterRole } = require("./libs/master-role.js");

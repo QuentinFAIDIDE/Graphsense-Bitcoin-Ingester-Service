@@ -14,6 +14,10 @@ var HEALTH_CHECK_RACE_PROBA_SECOND = 0.02;
 // the statistical analysis js code has a function for that
 var { findDistributedProtocolFreq } = require("./statistical-analysis.js");
 
+// detect if redis password setting is used
+var USE_REDIS_PASSWORD = !(typeof process.env.REDIS_PASSWORD == "undefined");
+var REDIS_PASSWORD = process.env.REDIS_PASSWORD;
+
 class ReplicaScheduler {
     /*
     Class responsible for making replicas talk to each other
@@ -21,12 +25,17 @@ class ReplicaScheduler {
   */
 
     constructor(redisHost, redisPort, symbol, logMessage, logErrors, debug, masterStartFunc) {
-        // save "this" pointer since nodejs loose it when entering callbacks
+        // save "this" pointer since nodejs loose it when entering callbacks on non anonymous functions
         let parentExec = this;
 
         // create the redis client
-        this._redisClient = redis.createClient({ port: redisPort, host: redisHost });
-        this._subClient = redis.createClient({ port: redisPort, host: redisHost });
+        if(USE_REDIS_PASSWORD==false) {
+            this._redisClient = redis.createClient({ port: redisPort, host: redisHost });
+            this._subClient = redis.createClient({ port: redisPort, host: redisHost });
+        } else {
+            this._redisClient = redis.createClient({ port: redisPort, host: redisHost, password: REDIS_PASSWORD });
+            this._subClient = redis.createClient({ port: redisPort, host: redisHost, password: REDIS_PASSWORD });
+        }
 
         // save important constructor variables
         this._currency = symbol;
