@@ -504,7 +504,7 @@ class WorkerRole {
                                             resolve();
                                         }
                                     });
-                                }).catch(reject);
+                            }).catch(reject);
                         } else {
                             rejectAndMoveToErrorStack(err);
                             return;

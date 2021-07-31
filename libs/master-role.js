@@ -911,7 +911,7 @@ class MasterRole {
                     }
 
                     // get the list of posted jobs to update the dates
-                    mult.lrange(this._currency.toUpperCase()+"::posted", 0, -1);
+                    mult.lrange(this._currency.toUpperCase()+"jobs::posted", 0, -1);
 
                     mult.exec((errMult,resMult)=>{
                         if(errMult) {
@@ -933,6 +933,7 @@ class MasterRole {
                                 if(splittedJob[0]==splittedPostedJob[1] &&
                                    splittedJob[1]==splittedPostedJob[2] &&
                                    splittedJob[3]==splittedPostedJob[3]) {
+                                    console.log("Match");
                                     // first remove it and repush with updated timestamp
                                     mult2.lrem(this._currency.toUpperCase()+"::jobs::posted", 1, resMult[resMult.length-1][j]);
                                     mult2.lpush(this._currency.toUpperCase()+"::jobs::posted", ""+Date.now()+"::"+splittedJob[0]+"::"+splittedJob[1]+"::"+splittedJob[3]);
