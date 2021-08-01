@@ -921,24 +921,18 @@ class MasterRole {
 
                         // now push back to todo
                         let mult2 = this._redisClient.multi();
-                        console.log("ex");
 
                         // remove worker id and push
                         for(let i=0;i<jobsToDrop.length;i++) {
-                            console.log("A");
                             let splittedJob = jobsToDrop[i].split("::");
                             // send pub/sub message to kill unresponsive replica
                             this._sendMessage("KILL", splittedJob[2]);
                             // now try to find the posted job to update its timeout
                             for(let j=0;j<resMult[resMult.length-1].length;j++) {
                                 let splittedPostedJob = resMult[resMult.length-1][j].split("::");
-                                console.log("comparing:");
-                                console.log(splittedJob);
-                                console.log(splittedPostedJob);
                                 if(splittedJob[0]==splittedPostedJob[1] &&
                                    splittedJob[1]==splittedPostedJob[2] &&
                                    splittedJob[3]==splittedPostedJob[3]) {
-                                    console.log("Match");
                                     // first remove it and repush with updated timestamp
                                     mult2.lrem(this._currency.toUpperCase()+"::jobs::posted", 1, resMult[resMult.length-1][j]);
                                     mult2.lpush(this._currency.toUpperCase()+"::jobs::posted", ""+Date.now()+"::"+splittedJob[0]+"::"+splittedJob[1]+"::"+splittedJob[3]);
