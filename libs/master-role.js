@@ -501,7 +501,7 @@ class MasterRole {
     _updateLastFilledBlockAndPopEnrichJobs(keyspaceobj) {
         return new Promise((resolve,reject)=>{
             // get the list of blocks range filled, no more than the 700 first ones
-            this._redisClient.lrange(""+this._currency.toUpperCase()+"::filled-ranges::"+keyspaceobj.name, "0", 1000, (errLR, resLR)=>{
+            this._redisClient.lrange(""+this._currency.toUpperCase()+"::filled-ranges::"+keyspaceobj.name, "0", -1, (errLR, resLR)=>{
                 // error handling
                 if(errLR) {
                     reject(errLR);
@@ -596,7 +596,7 @@ class MasterRole {
     _checkErrorStack() {
         return new Promise((resolve, reject)=>{
             // get the first 50 elements of the error stack
-            this._redisClient.lrange(""+this._currency.toUpperCase()+"::jobs::errors", 0, 1000, (errLR, resLR)=>{
+            this._redisClient.lrange(""+this._currency.toUpperCase()+"::jobs::errors", 0, -1, (errLR, resLR)=>{
                 if(errLR) {
                     this._logErrors("Error at redis lrange in _checkErrorStack");
                     reject(errLR);
@@ -671,7 +671,7 @@ class MasterRole {
         return new Promise((resolve,reject)=>{
 
             // pull 600 leftmost (eg oldest) ranges enriched to check furthest block below which everything is filled
-            this._redisClient.lrange(""+this._currency.toUpperCase()+"::"+keyspaceobj.name+"::enriched-ranges", 0, 1000, (errLR, resLR)=>{
+            this._redisClient.lrange(""+this._currency.toUpperCase()+"::"+keyspaceobj.name+"::enriched-ranges", 0, -1, (errLR, resLR)=>{
                 // error handling
                 if(errLR) {
                     reject(errLR);
