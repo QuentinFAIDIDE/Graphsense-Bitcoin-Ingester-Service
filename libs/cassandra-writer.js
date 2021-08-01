@@ -547,36 +547,69 @@ class CassandraWriter {
                 }
             }
         };
+        
 
-        // for each input in the tx
-        for(let j=0;j<inputData.t.length;j++) {
-            // TODO OPTIMIZATION: try using redis cache here first
-            // get corresponding UTXOs from cassandra
-            this._transactionModels[keyspace].findOne({
-                tx_prefix: inputData.t[j][0].substring(0,5),
-                tx_hash: Buffer.from(inputData.t[j][0], "hex")
-            }, { select: ["tx_prefix","tx_hash","outputs"]}, (err, transac)=>{
-                // if error, stop right away and push 
-                if(err) {
-                    this._logErrors(err);
-                    failedCassandraRead=true;
-                } else {
-                    if(typeof transac == "undefined" || transac==null) {
-                        this._logErrors("FATAL: Unable to find transaction "+inputData.t[j][0]);
-                        process.exit(1);
-                    }
-                    // if no error, get the right output and set it as the input
-                    txInputs[j] = transac.outputs[inputData.t[j][1]];
-                    // delete the unspent output from the redis cache
-                    if(USING_REDIS_UTXO_CACHE=="true") {
-                        this._redisUTXoCacheClient.del(inputData.t[j][0]+":"+inputData.t[j][1], (errDel)=>{
-                            if(errDel)this._logErrors("Failed to clear some cache data in redis cache:"+errDel);
-                        });
-                    }
-                }
-                foundInputCallback();
+        // input format as inputData:
+        //inputList.push([jsonObj.inputs[j].spent_transaction_hash,jsonObj.inputs[j].spent_output_index]);
+        // JSON.stringify({h:row.tx_hash,t:inputList, o:row.outputs}
+        
+        // input format inside getSetTxInOutCache:
+        // inputs[i].spent_transaction_hash+":"+inputs[i].spent_output_index
+
+        // build an object in the right format for getSetTxInOutCache
+        let inputInfos= [];
+        for(let k=0;k<inputData.t.length;k++) {
+            inputInfos.push({
+                spent_transaction_hash: inputData.t[k][0],
+                spent_output_index: inputData.t[k][1]
             });
         }
+
+        // get tx inputs from redis UTXO Cache
+        this._getSetTxInOutCache(null, inputInfos, []).then((found_inputs)=>{
+
+            // if input were not found in redis, fallback to cassandra
+            if(found_inputs==null) {
+
+                // for each input in the tx
+                for(let j=0;j<inputData.t.length;j++) {
+                    // TODO OPTIMIZATION: try using redis cache here first
+                    // get corresponding UTXOs from cassandra
+                    this._transactionModels[keyspace].findOne({
+                        tx_prefix: inputData.t[j][0].substring(0,5),
+                        tx_hash: Buffer.from(inputData.t[j][0], "hex")
+                    }, { select: ["tx_prefix","tx_hash","outputs"]}, (err, transac)=>{
+                        // if error, stop right away and push 
+                        if(err) {
+                            this._logErrors(err);
+                            failedCassandraRead=true;
+                        } else {
+                            if(typeof transac == "undefined" || transac==null) {
+                                this._logErrors("FATAL: Unable to find transaction "+inputData.t[j][0]);
+                                process.exit(1);
+                            }
+                            // if no error, get the right output and set it as the input
+                            txInputs[j] = transac.outputs[inputData.t[j][1]];
+                            // delete the unspent output from the redis cache
+                            if(USING_REDIS_UTXO_CACHE=="true") {
+                                this._redisUTXoCacheClient.del(inputData.t[j][0]+":"+inputData.t[j][1], (errDel)=>{
+                                    if(errDel)this._logErrors("Failed to clear some cache data in redis cache:"+errDel);
+                                });
+                            }
+                        }
+                        foundInputCallback();
+                    });
+                }
+
+            // if inputs were found in redis
+            } else {
+
+                txInputs = found_inputs;
+                txFound=inputData.t.length-1;
+                foundInputCallback();
+
+            }
+        });
     }
 
     getFillingJobStatus(jobname) {
@@ -1070,11 +1103,6 @@ class CassandraWriter {
     // TODO: encore all type of addresses efficiently and switch to using buffers
     _getSetTxInOutCache(tx_hash, inputs, outputs) {
         return new Promise((resolve,reject)=>{
-            // must resolve to false if input size is zero
-            if(inputs.length==0) {
-                resolve(null);
-                return;
-            }
 
             // if redis UTXO cache is not used
             if(USING_REDIS_UTXO_CACHE!="true") {
@@ -1082,6 +1110,27 @@ class CassandraWriter {
                 resolve(null);
                 return;
             }
+
+            // save the tx outputs
+            for(let i=0;i<outputs.length;i++) {
+                this._redisUTXoCacheClient.set(tx_hash+":"+i, JSON.stringify({
+                    a: outputs[i].address,
+                    v: outputs[i].value,
+                    t: outputs[i].address_type
+                }), (errSet,resSet)=>{
+                    if(errSet) {
+                        this._logErrors("Error while saving tx output to redis cache.");
+                        this._logErrors(errSet);
+                    }
+                });
+            }
+
+            // must resolve to false if input size is zero
+            if(inputs.length==0) {
+                resolve(null);
+                return;
+            }
+
 
             let inputsFound = [];
 
@@ -1142,20 +1191,6 @@ class CassandraWriter {
                     }
                 }
             };
-
-            // save the tx outputs
-            for(let i=0;i<outputs.length;i++) {
-                this._redisUTXoCacheClient.set(tx_hash+":"+i, JSON.stringify({
-                    a: outputs[i].address,
-                    v: outputs[i].value,
-                    t: outputs[i].address_type
-                }), (errSet,resSet)=>{
-                    if(errSet) {
-                        this._logErrors("Error while saving tx output to redis cache.");
-                        this._logErrors(errSet);
-                    }
-                });
-            }
 
             // get the tx inputs (and call the previously defined callback)
             for(let i=0;i<inputs.length;i++) {
