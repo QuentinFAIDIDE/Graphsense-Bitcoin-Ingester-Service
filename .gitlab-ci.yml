@@ -16,7 +16,7 @@ cache:
     - node_modules/
 
 variables:
-  TESTING: "true"
+  CASSANDRA_CONTACT_POINTS: "127.0.0.1"
   REDIS_HOST: "redis"
   REDIS_PORT: "6379"
 
