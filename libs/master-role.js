@@ -104,7 +104,7 @@ class MasterRole {
 
     // PRIVATE METHODS
     /* act on received messages on the redis channel for replicas scheduling */
-    /* message is formatted as so: "[TIMESTAMP]::[IDENTIFIER_EMITTER]::[ACTION]::[PARAMETER1,PARAMETER2,etc..]*/
+    /* message is formatted as so: "[CURRENCY]::[TIMESTAMP]::[IDENTIFIER_EMITTER]::[ACTION]::[PARAMETER1,PARAMETER2,etc..]*/
     _parseChannelMessage(msg) {
         try {
             // parsing the message parameters
@@ -501,7 +501,7 @@ class MasterRole {
     _updateLastFilledBlockAndPopEnrichJobs(keyspaceobj) {
         return new Promise((resolve,reject)=>{
             // get the list of blocks range filled, no more than the 700 first ones
-            this._redisClient.lrange(""+this._currency.toUpperCase()+"::filled-ranges::"+keyspaceobj.name, "0", "700", (errLR, resLR)=>{
+            this._redisClient.lrange(""+this._currency.toUpperCase()+"::filled-ranges::"+keyspaceobj.name, "0", 1000, (errLR, resLR)=>{
                 // error handling
                 if(errLR) {
                     reject(errLR);
@@ -512,8 +512,6 @@ class MasterRole {
                     resolve();
                     return;
                 }
-                // tick out all the posted enriched jobs that have confirmed termination with this pushed ranges
-                this._;
                 // parse ranges
                 let ranges = [];
                 for(let i=0;i<resLR.length;i++) {
@@ -552,7 +550,7 @@ class MasterRole {
                 }
 
                 // if nothing changed, return 
-                if(fillJobFinishedIterator==0) {
+                if(fillJobFinishedIterator==0 && ranges_to_clear.length==0) {
                     resolve();
                     return;
                 }
@@ -673,7 +671,7 @@ class MasterRole {
         return new Promise((resolve,reject)=>{
 
             // pull 600 leftmost (eg oldest) ranges enriched to check furthest block below which everything is filled
-            this._redisClient.lrange(""+this._currency.toUpperCase()+"::"+keyspaceobj.name+"::enriched-ranges", 0, 600, (errLR, resLR)=>{
+            this._redisClient.lrange(""+this._currency.toUpperCase()+"::"+keyspaceobj.name+"::enriched-ranges", 0, 1000, (errLR, resLR)=>{
                 // error handling
                 if(errLR) {
                     reject(errLR);
@@ -723,7 +721,7 @@ class MasterRole {
                 }
 
                 // if nothing changed, return 
-                if(enrichJobFinishedIterator==0) {
+                if(enrichJobFinishedIterator==0 && ranges_to_clear.length==0) {
                     resolve();
                     return;
                 }

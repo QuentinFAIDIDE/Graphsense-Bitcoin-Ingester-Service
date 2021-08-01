@@ -37,7 +37,7 @@ install_libs:
 lint:
   stage: lint
   script:
-    - node_modules/eslint/bin/eslint.js libs/* index.js
+    - node_modules/eslint/bin/eslint.js libs/* index.js --exit
 
 tests:
   stage: tests
