@@ -35,13 +35,9 @@ Hopefully, these are problems than could be overcome because:
 
 ## Features for the future
 - Docker swarm stack compose yamls to have an easier time deploying the service.
-- Add a setting to thottle the Cassandra I/O 
-- Automatically scale the I/O to the components by monitoring error rates of each and have more explicit error messages.
-- Display more metrics in the dashboard to have a better understanding of bottleneck and requirements.
 - Allow microservices replicas to halt with a cli command.
 
 ## Known bugs we plan on fixing (reminder that this is an alpha version)
-- With more than 60 microservice replicas, there is a possibility of a job loss bug that may softlock ingestion.
 - There is a missing input field in the lists from the `block_transaction` table when the redis utxo cache is not used (10% of transactions approximately are affected if you are using the utxo cache, 100% if not). This is not fatal to graphsense and there is also an option to ignore that table.
 - Some schema types has been changed in newer development Graphsense versions and we would need to make it compatible with future releases.
 

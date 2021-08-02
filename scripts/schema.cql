@@ -2,19 +2,19 @@ CREATE KEYSPACE [MY_KEYSPACE_NAME] WITH replication = {'class': 'NetworkTopology
 
 USE [MY_KEYSPACE_NAME];
 
-CREATE TYPE test_enrich.tx_input_output (
+CREATE TYPE tx_input_output (
     address list<text>,
     value bigint,
     address_type smallint
 );
-CREATE TYPE test_enrich.tx_summary (
+CREATE TYPE tx_summary (
     tx_hash blob,
     no_inputs int,
     no_outputs int,
     total_input bigint,
     total_output bigint
 );
-CREATE TABLE test_enrich.exchange_rates (
+CREATE TABLE exchange_rates (
     date text PRIMARY KEY,
     eur float,
     usd float
@@ -32,7 +32,7 @@ CREATE TABLE test_enrich.exchange_rates (
     AND min_index_interval = 128
     AND read_repair_chance = 0.0
     AND speculative_retry = '99PERCENTILE';
-CREATE TABLE test_enrich.transaction (
+CREATE TABLE transaction (
     tx_prefix text,
     tx_hash blob,
     coinbase boolean,
@@ -60,7 +60,7 @@ CREATE TABLE test_enrich.transaction (
     AND min_index_interval = 128
     AND read_repair_chance = 0.0
     AND speculative_retry = '99PERCENTILE';
-CREATE TABLE test_enrich.summary_statistics (
+CREATE TABLE summary_statistics (
     id text PRIMARY KEY,
     no_blocks int,
     no_txs bigint,
@@ -79,7 +79,7 @@ CREATE TABLE test_enrich.summary_statistics (
     AND min_index_interval = 128
     AND read_repair_chance = 0.0
     AND speculative_retry = '99PERCENTILE';
-CREATE TABLE test_enrich.block (
+CREATE TABLE block (
     height int PRIMARY KEY,
     block_hash blob,
     no_transactions int,
@@ -98,7 +98,7 @@ CREATE TABLE test_enrich.block (
     AND min_index_interval = 128
     AND read_repair_chance = 0.0
     AND speculative_retry = '99PERCENTILE';
-CREATE TABLE test_enrich.block_transactions (
+CREATE TABLE block_transactions (
     height int PRIMARY KEY,
     txs list<frozen<tx_summary>>
 ) WITH bloom_filter_fp_chance = 0.01

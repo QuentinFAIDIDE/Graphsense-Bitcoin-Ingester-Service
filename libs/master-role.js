@@ -1264,7 +1264,7 @@ class MasterRole {
         } else if (height<400000) {
             return 50;
         } else if (height<500000) {
-            return 10;
+            return 20;
         } else {
             return 10;
         }
