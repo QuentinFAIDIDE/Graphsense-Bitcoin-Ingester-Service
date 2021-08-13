@@ -262,10 +262,25 @@ class MasterRole {
 
                                             this._updateLastEnrichedBlockAndStatistics(keyspaces[i]).then(()=>{
 
-                                                // if last block availabl minus confirm delay is bigger than last keyspace block
-                                                if(Number(keyspaces[i].lastQueuedBlock) < Number(maxheight) - Number(keyspaces[i].delay)) {
-                                                    // push a job for the new block
+                                                // read the feedUntill parameter if exists, and set it to a arbitrarly high value else
+                                                let feedUntill = -1;
+                                                if(Object.prototype.hasOwnProperty.call(keyspaces[i], "feedUntill")==true) {
+                                                    feedUntill = Number(keyspaces[i].feedUntill);
+                                                } else {
+                                                    feedUntill = Number(maxheight)+1;
+                                                }
+
+                                                // if last block availabl minus confirm delay is bigger than last written keyspace block
+                                                // and that the last written block is below the user defined maxmium block to ingest
+                                                if(Number(keyspaces[i].lastQueuedBlock) < Number(maxheight) - Number(keyspaces[i].delay)
+                                                && Number(keyspaces[i].lastQueuedBlock) < feedUntill) {
+                                                    // define the missing range to cover
                                                     let range = [Number(keyspaces[i].lastQueuedBlock)+1 ,Number(maxheight) - Number(keyspaces[i].delay)];
+
+                                                    // if the range upper part is above the user defined maximum, truncate it
+                                                    if(range[1]>feedUntill) {
+                                                        range[1]=feedUntill;
+                                                    }
                                                     
                                                     let jobname;
 

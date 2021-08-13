@@ -82,7 +82,65 @@ describe("Master job and messaging functions", function () {
                 });
             }, 1000);
         });
+    });
+});
 
+describe("Master feedUntill parameter to post jobs", function () {
+
+    this.timeout(5000);
+
+    it("should post 50 jobs", (done)=>{
+
+        let master = new MasterRole(REDIS_HOST, REDIS_PORT, "TEST30", console.log, console.log, console.log);
+        let mult1 = redisClient.multi();
+        mult1.sadd("TEST30::monitored-keyspaces", "ks1");
+        mult1.del("TEST30::monitored::ks1");
+        mult1.del("TEST30::jobs::todo");
+        mult1.del("TEST30::jobs::doing");
+        mult1.del("TEST30::jobs::done");
+        mult1.del("TEST30::jobs::posted");
+        mult1.hmset("TEST30::monitored::ks1", "feedFrom", 0, "lastQueuedBlock", -1, "delay", 10, "name", "ks1", "lastFilledBlock", -1, "feedUntill", 100000);
+
+        master._checkActiveJobLiveliness = ()=>{
+            return new Promise((resolve,reject)=>{resolve();});
+        };
+        master._checkErrorStack = ()=>{
+            return new Promise((resolve,reject)=>{resolve();});
+        };
+        master._getLastAvailableBlock = ()=>{
+            return new Promise((resolve,reject)=>{resolve(600000);});
+        };
+        master._checkTimedOutJobs = ()=>{
+            return new Promise((resolve,reject)=>{resolve();});
+        };
+        let yesterday = master._getYesterdayDateTxt();
+        let lastRateIngested = "";
+        master._updateRatesForKeyspaceForRange = (keyspace, from, to) =>{
+            lastRateIngested = to;
+        };
+
+        mult1.exec((errEx,resEx)=>{
+            master._runJobCheck();
+
+            setTimeout(()=>{
+                master._runJobCheck();
+                setTimeout(()=>{
+                    redisClient.lrange("TEST30::jobs::todo", 0, -1, (errLR1,resLR1)=>{
+                        redisClient.lrange("TEST30::jobs::posted", 0, -1, (errLR2,resLR2)=>{
+
+                            assert.strictEqual(lastRateIngested, yesterday);
+                            assert.strictEqual(resLR1.length, 51);
+                            assert.strictEqual(resLR2.length, 51);
+                            
+                            // get the last posted range
+                            let lastblock = resLR1[resLR1.length-1].split("::")[2].split(",")[1];
+                            assert.strictEqual(lastblock, "100000");
+                            done();
+                        });
+                    });
+                }, 1000);    
+            }, 1000);
+        });
     });
 });
 
