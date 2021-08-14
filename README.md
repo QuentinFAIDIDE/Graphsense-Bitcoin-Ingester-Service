@@ -2,10 +2,9 @@
 Micro-services that ingest Bitcoin blocks and transactions data in Cassandra following the Graphsense cql schemas (Work in Progress).
 
 
-This software is still in early alpha, many features are missing. Also, it is not an official graphsense project.
+This software is still in early alpha, some features are missing and you might encounter bugs or suboptimal misconfigurations. Also, it is not an official graphsense project.
 
 ## Usage
-This software has a separate CLI tool to interract with the replicated microservices.
 You will need to:
 - deploy the microservice
 - deploy the main redis cache
@@ -13,42 +12,40 @@ You will need to:
 - deploy Cassandra
 - deploy the bitcoin core clients
 - download the cli control tool
-- add your keyspace
-- open the dashboard to watch for errors (it may work for the first 300k blocks but have Cassandra dying under 400k/opsec later !)
+- add your keyspace with a call to the cli tool
+- open the dashboard to watch for errors
 - adjust the number of microservice replica, the concurrencies, scale up your databases/caches, etc...
 
-## Discussing bottlenecks
-It is still hard to configure these microservices to work properly for a few reasons:
-- Either cassandra, redis, or bitcoin clients will be your bottleneck, and it may change as you progress.
-- There is no 'stop' button yet, you would if you need scale the microservice to zero.
-- Cassandra may take more writes than it can handle and make errors rains after its cache is full.
-- Bitcoin Core clients return a 500 error when their max queue size for api requests are full and should not be stressed.
-- You may have an easier time using this service with a Kubernetes or Docker Swarm cluster because of the wide variety of services required.
-- It requires lots of computing power to ingest at descent rates as the data volume is in terabytes.
-
-Hopefully, these are problems than could be overcome because:
-- You have a monitoring cli dashboard with error logs to find out which service is having failures and scale it up.
-- Every component (the software, redis, redis utxo cache, bitcoin clients or cassandra) can be scaled horizontally as long as you have the resources.
-- Automatic recovery of errors happens at two levels: internal to jobs for a few I/O failures in cassandra, and external to jobs with an errored jobs stack for more severe bitcoin client or cassandra errors that caused more than 100 failures per job. The failed job are then retry one time before marking the keyspace as broken and stopping new jobs creations.
-- If you are running graphsense chances are that you have enought processing power to make it easy to find your sweet spot.
-- There is an option to set up a redis UTXO cache, and it can even be set to use a distributed Redis Cluster. This can make the process incredibly more efficient and considerably reduce cassandra errors (because we do not need to read to Cassandra anymore most of the time).
-
-## Features for the future
-- Docker swarm stack compose yamls to have an easier time deploying the service.
-- Allow microservices replicas to halt with a cli command.
-
-## Known bugs we plan on fixing (reminder that this is an alpha version)
-- There is a missing input field in the lists from the `block_transaction` table when the redis utxo cache is not used (10% of transactions approximately are affected if you are using the utxo cache, 100% if not). This is not fatal to graphsense and there is also an option to ignore that table.
+## Known issue
+- There is a missing total_input value in the lists from the `block_transaction` table when the redis utxo cache is not used (10% of transactions approximately are affected if you are using the utxo cache, 100% if not). This is not fatal to graphsense and there is also an option to ignore that table.
 - Some schema types has been changed in newer development Graphsense versions and we would need to make it compatible with future releases.
+- Running the transformation cause an overflow on the transaction index despise that it's a big int. A fix is described in the following section.
 
-## Requirements 
-You will need:
-- At least one bitcoin core client
-- A redis instance
-- Preferably a docker swarm or kubernetes instances to manage replicas in production, but you can also run the nodejs program directly. (note: prefer docker swarm to kubernetes for simpler deployments)
-- Nodejs and Npm installed
-- bitcoinetl installed
-- cqlsh installed
+### Overflow while running the graphsense transformation
+Distributing transaction indexing required to have gaps in the index. Unfortunately, the spark cassandra connectors or the sql spark functions seems to cast the Long index to an Int so it will overflow, and the transformation will never ends. So as long as this is not getting fixed, you will need to reindex the transactions to be without gaps.
+
+
+For that, in the graphsense transformation file `src/main/scala/at/ac/ait/TransformationJob.scala`, rename the transaction table when imported from:
+```scala
+val transactions =
+  cassandra.load[Transaction](conf.rawKeyspace(), "transaction")
+``` 
+to:
+```scala
+val transactionsRaw =
+  cassandra.load[Transaction](conf.rawKeyspace(), "transaction")
+``` 
+
+And then, add these instructions before the transaction table first get used:
+```scala
+// reindex the transactions 
+val transactions = transactionsRaw.sort("txIndex")
+  .rdd.zipWithIndex.map {
+      case (row, index) => Transaction(row.txPrefix, row.txHash, row.height, row.timestamp, row.coinbase, row.coinjoin, row.totalInput, row.totalOutput, row.inputs, row.outputs, index)
+  }
+  .toDS()
+```
+
 
 ## Development deployment
 
