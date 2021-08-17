@@ -46,7 +46,7 @@ function findDistributedProtocolFreq(probability, replicas) {
     // now let's iterate to converge to the root
     let niter = 0;
     let sqerr = 1;
-    let xn = minProbBinom;
+    let xn = 1/(replicas-1);
     // while we have not wasted too much trials or found satisfying result
     while(niter<NEWTON_MAX_ITER && sqerr>NEWTON_ERR_THRESOLD) {
         // compute next x
