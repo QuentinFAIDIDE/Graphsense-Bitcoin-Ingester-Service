@@ -526,7 +526,12 @@ class CassandraWriter {
                     let total_input = BigInt(0);
                     // compute total input value
                     for(let i=0;i<txInputs.length;i++) {
-                        total_input += txInputs[i].value;
+                        total_input += Number(txInputs[i].value);
+                        // try to catch overflow in the cassandra driver
+                        if(Number(txInputs[i].value)<0) {
+                            this._logErrors("Negative input amount detected in tx enrichment: report that to the devs.");
+                            process.exit(1);
+                        }
                     }
                     // now, run the coinjoin algorithm on the in/outs
                     let coinjoin = this._detectCoinjoin({inputs: txInputs, outputs: inputData.o});
@@ -585,7 +590,8 @@ class CassandraWriter {
                             failedCassandraRead=true;
                         } else {
                             if(typeof transac == "undefined" || transac==null) {
-                                this._logErrors("FATAL: Unable to find transaction "+inputData.t[j][0]);
+                                this._logErrors("Unable to find transaction "+inputData.t[j][0]);
+                                this._logErrors("Make sure that your cassandra instance is not overloaded or try to use UTXO cache");
                                 process.exit(1);
                             }
                             // if no error, get the right output and set it as the input
@@ -1029,7 +1035,7 @@ class CassandraWriter {
                             // compute the total input value
                             let totalInput = 0;
                             for(let i=0;i<row.inputs.length;i++) {
-                                totalInput += row.inputs[i].value;
+                                totalInput += Number(row.inputs[i].value);
                             }
                             row.total_input = String(totalInput);
                             // do the coinjoin detection
