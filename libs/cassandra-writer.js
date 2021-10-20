@@ -1401,7 +1401,8 @@ class CassandraWriter {
                         input_addrs.push(tx.inputs[i].address[j]);
                 }
             } catch(err) {
-                this._debug("Faulty input at index "+i+": "+JSON.stringify(tx));
+                this._logErrors("Faulty input at index "+i+": "+tx);
+                this._logErrors("Error:"+err);
             }
         }
         if(participantCount > input_addrs.length) {
