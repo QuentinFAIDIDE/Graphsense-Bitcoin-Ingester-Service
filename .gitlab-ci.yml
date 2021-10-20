@@ -45,7 +45,7 @@ tests:
     - npm test
 
 release:
-  image: node:13
+  image: node:14
   stage: release
   only:
     refs:
