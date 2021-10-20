@@ -16,8 +16,13 @@ You will need to:
 - open the dashboard to watch for errors
 - adjust the number of microservice replica, the concurrencies, scale up your databases/caches, etc...
 
+There are three ways to deploy the service:
+- Deployment/custom deployments where you have all required units deployed independently (not advised for production as you would rather have control over the number of replicas)
+- Simple deployment in a docker swarm stack
+- Advanced deployment in kubernetes
+
 ## Known issue
-- There is a missing total_input value in the lists from the `block_transaction` table when the redis utxo cache is not used (10% of transactions approximately are affected if you are using the utxo cache, 100% if not). This is not fatal to graphsense and there is also an option to ignore that table.
+- There is a missing total_input value in the lists from the `block_transaction` table when the redis utxo cache is not used (10% of transactions approximately are affected if you are using the utxo cache, 100% if not). This is not fatal to graphsense as this value does not seems to be used, and there is also an option to ignore that table completely.
 - Some schema types has been changed in newer development Graphsense versions and we would need to make it compatible with future releases.
 - Running the transformation cause an overflow on the transaction index despise that it's a big int. A fix is described in the following section.
 
@@ -44,6 +49,38 @@ val transactions = transactionsRaw.sort("txIndex")
       case (row, index) => Transaction(row.txPrefix, row.txHash, row.height, row.timestamp, row.coinbase, row.coinjoin, row.totalInput, row.totalOutput, row.inputs, row.outputs, index)
   }
   .toDS()
+```
+
+## Simple Docker Swarm deployment 
+
+This deployment still implies you have an external cassandra deployment to interract with. We also do not persist the redis caches data, you will want to persist it in case of failure for more advanced deployments.
+
+Make sure to be logged into your container registry: 
+```
+docker login registry.gitlab.com -u USERNAME -p <token>
+```
+
+You will also need docker-compose.
+
+
+You then need to choose between the deployment with the utxo cache `docker-compose-utxo.yml` (faster, strongly suggested for full ingesting but uses more RAM) and the vanilla deployment `docker-compose-no-utxo.yml` (less efficient, slower, you would rather activate it only after having ingested the blockchain for continuous updates that required less ram and speed).
+
+
+You need to add in your favourite deployment file the contact points to your cassandra nodes/datacenter and bitcoin nodes, as well as the path to your container registry. Please scroll below to have detailed descriptions of the environment variables to use to set cassandra and bitcoin nodes.
+
+To build and deploy the docker image, set you desired number of replicas and run:
+
+```
+docker-compose up -f docker-compose-utxo.yml
+```
+
+
+```
+./gsingestctl add_keyspace -k btc_raw_05_08_2021 -r 10.35.33.60 -p 32458
+```
+
+```
+./gsingestctl watch_keyspace -k btc_raw -r 10.35.33.60 -p 32458 --save-logs
 ```
 
 
@@ -123,9 +160,6 @@ node index.js
 ```
 
 ## Production deployments
-
-### Docker Swarm
-**Todo**: Docker swarm docker-compose yaml for easy deployment.
 
 ### Kubernetes
 Most probably, devops will know how to deploy a service to their clusters, but for those who need a simplified deployment procedure, we will cover the following. 

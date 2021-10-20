@@ -7,6 +7,7 @@ const net = require("net");
 const { exec } = require("child_process");
 const {CassandraWriter} = require("./cassandra-writer.js");
 const randomstring = require("randomstring");
+const { streamBlockAndTransactions, streamBlockRange } = require("./bitcoin-nodes.js");
 
 let MAX_JOBS_PER_REPLICA = 1;
 // the best value to avoid crashing a single bitcoin node
@@ -253,132 +254,28 @@ class WorkerRole {
 
     _streamBlocksAndTransactions(minblock, maxblock, block_callback, transaction_callback) {
         return new Promise((resolve,reject)=>{
-            // generate a random identifier
-            let taskid = randomstring.generate(8);
-            // blocks and transaction tasks filenames
-            let bfilename = taskid+"-blocks";
-            let tfilename = taskid+"-transactions";
-            // we use that boolean to avoid rejecting and then resolveing when pipes closed
-            var rejectedWithError = false;
 
-            // this callback is to be called when everything has been processed
-            let everythingFinishedCallback = ()=>{
-                // resolve
-                if(rejectedWithError == false)
-                    resolve();
-                // clear the pipes files
-                exec("rm pipes/"+bfilename+".json pipes/"+tfilename+".json", (errRM, stdoRM, stdeRM)=>{
-                    if(errRM) {
-                        this._logErrors("ERROR(worker._streamBlocksAndTransactions): Unable to delete the pipe files:"+errRM);
-                    }
-                });
-            };
-
-            // callback to monitor closed pipes
-            let nclosed = 0;
-            let pipeclosed = ()=>{
-                nclosed++;
-                // if all pipes are finished
-                if(nclosed==2) {
-                    everythingFinishedCallback();
-                }
-            };
-
-            // create the two pipe files
-            exec("mkfifo pipes/"+bfilename+".json pipes/"+tfilename+".json", (err,stdo,stde)=>{
-                // error handling
-                if(err) {
-                    rejectedWithError = true;
-                    reject("Error:"+err);
-                    return;
-                }
-                // open the blocks pipe
-                fs.open("pipes/"+bfilename+".json", fs.constants.O_RDONLY | fs.constants.O_NONBLOCK, (err, fd)=>{
-                    // error handling
-                    if(err) {
-                        rejectedWithError = true;
-                        reject("error while opening block pipe file:"+err);
+            // choose one of the longest unused bitcoin client
+            this._redisClient.lmove(this._currency+"::node-clients",
+                this._currency+"::node-clients", 
+                "RIGHT", "LEFT", (errLMOV, resLMOV)=>{
+                    // error checking
+                    if(errLMOV) {
+                        reject("REDIS ERROR (worker._streamBlocksAndTransactions): "+errLMOV);
                         return;
                     }
-                    
-                    // create the socket from the file
-                    const pipe = new net.Socket({fd});
-                    // redirect to callback
-                    pipe.on("data", block_callback);
-                    pipe.on("end", pipeclosed);
-                    pipe.on("error", (err)=>{this._logErrors("block pipe err:"+err);});
-                    
 
-                    // open the transaction pipe
-                    fs.open("pipes/"+tfilename+".json", fs.constants.O_RDONLY | fs.constants.O_NONBLOCK, (err2, fd2)=>{
-                        // error handling
-                        if(err2) {
-                            rejectedWithError = true;
-                            reject("error while opening transaction pipe file:"+err2);
-                            return;
-                        }
-                        // create the socket from the file
-                        var pipe2 = new net.Socket({fd:fd2});
+                    // if no node contact info was found
+                    if(resLMOV==null || resLMOV=="") {
+                        reject("Empty node host list (worker._streamBlocksAndTransactions)");
+                        return;
+                    }
 
-                        // redirect to callback
-                        pipe2.on("data", transaction_callback);
-                        pipe2.on("end", pipeclosed);
-                        pipe2.on("error", (err)=>{this._logErrors("transaction pipe err:"+err);});
+                    // stream blocks from bitcoin node rpc api
+                    streamBlockRange(resLMOV, minblock, maxblock, block_callback,
+                        transaction_callback).then(resolve);
 
-                        // now it's time to launch our command the write to the pipes !
-                        // but first we must choose on of the longest unused bitcoin client
-                        this._redisClient.lmove(this._currency+"::node-clients",
-                            this._currency+"::node-clients", 
-                            "RIGHT", "LEFT", (errLMOV, resLMOV)=>{
-                            // error checking
-                                if(errLMOV) {
-                                    rejectedWithError = true;
-                                    reject("REDIS ERROR (worker._streamBlocksAndTransactions): "+errLMOV);
-                                    pipe.end();
-                                    pipe2.end();
-                                    return;
-                                }
-
-                                // if no node contact info was found
-                                if(resLMOV==null || resLMOV=="") {
-                                    rejectedWithError = true;
-                                    reject("Empty node host list (worker._streamBlocksAndTransactions)");
-                                    pipe.end();
-                                    pipe2.end();
-                                    return;
-                                }
-
-                                // if everything is alright, we launch the command
-                                let command = "bitcoinetl export_blocks_and_transactions --start-block "+minblock+
-                                " --end-block "+maxblock+" -w 1 -p http://"+process.env.CRYPTO_CLIENTS_LOGIN+
-                                ":"+process.env.CRYPTO_CLIENTS_PWD+"@"+resLMOV+" --chain bitcoin --blocks-output pipes/"+
-                                bfilename+".json --transactions-output pipes/"+tfilename+".json ";
-
-                                this._debug("Calling command: "+command);
-                                // spawn the child
-                                var childETLProcess = exec(command);
-                                // let's just redirect ETL's stderr in case we might miss important logs
-                                childETLProcess.stderr.on("data", (logtxt)=>{
-                                    this._debug("ETL client stderr:"+logtxt);
-                                    // we need to parse for errors in case the exit code is not 1 (it happens sometimes)
-                                    if(logtxt.indexOf("Internal Server Error")!=-1 || logtxt.indexOf("Traceback")!=-1) {
-                                        rejectedWithError = true;
-                                        reject("ETL Process rejected with Internal Server Error: "+logtxt);
-                                    }
-                                });
-                                childETLProcess.stdout.on("data", (logtxt)=>{this._debug("ETL client stdout:"+logtxt);});
-                                // on close, make sure pipes are closed
-                                childETLProcess.on("close", (code)=>{
-                                    // now, if there was an error code, reject, or if all good, wait for end of pipes
-                                    if(code!=0) {
-                                        rejectedWithError = true;
-                                        reject("ETL Process rejected with code:"+code);
-                                    }
-                                });
-                            });
-                    });
                 });
-            });
         });
     }
 
