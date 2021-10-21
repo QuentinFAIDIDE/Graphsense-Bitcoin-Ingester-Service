@@ -37,8 +37,8 @@ function streamBlockAndTransactions(btcClient, blockHash, blockCallback, transac
                 for(let j=0; j<block_and_txs.tx[i].vout.length;j++) {
                     sumOutput += block_and_txs.tx[i].vout[j].value;
                     outputList.push({
-                        address: block_and_txs.tx[i].vout[j].scriptPubKey.addresses,
-                        address_type: block_and_txs.tx[i].vout[j].scriptPubKey.type,
+                        addresses: block_and_txs.tx[i].vout[j].scriptPubKey.addresses,
+                        type: block_and_txs.tx[i].vout[j].scriptPubKey.type,
                         value: btcToSats(block_and_txs.tx[i].vout[j].value)
                     }); 
                 }
