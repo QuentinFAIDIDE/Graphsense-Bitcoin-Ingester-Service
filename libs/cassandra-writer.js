@@ -597,6 +597,10 @@ class CassandraWriter {
                             }
                             // if no error, get the right output and set it as the input
                             txInputs[j] = transac.outputs[inputData.t[j][1]];
+                            // just in case cassandra wants to set addresses to null
+                            if(txInputs[j].address==null || typeof txInputs[j].address === "undefined") {
+                                txInputs[j].address = [];
+                            }
                             // delete the unspent output from the redis cache
                             if(USING_REDIS_UTXO_CACHE=="true") {
                                 this._redisUTXoCacheClient.del(inputData.t[j][0]+":"+inputData.t[j][1], (errDel)=>{
@@ -1064,6 +1068,12 @@ class CassandraWriter {
                         value: outputObj.v,
                         address_type: outputObj.t
                     };
+                    // just in case nonstandard or nulldata tx is in old format
+                    if(typeof inputsFound[i].address == "undefined"
+                    || inputsFound[i].address == null) {
+                        // change that to an empty array
+                        inputsFound[i].address = [];
+                    }
                     // if it was the last one, return the list of inputs found
                     if(nbInputFound>=inputsToFind) {
                         resolvedAlready=true;
@@ -1341,7 +1351,7 @@ class CassandraWriter {
             }
             let value = "0";
             let addresses = [];
-            if(typeof etlObj[i].addresses == "undefined") {
+            if(typeof etlObj[i].addresses == "undefined" || etlObj[i].addresses==null) {
                 addresses = [];
             } else {
                 addresses = etlObj[i].addresses;
