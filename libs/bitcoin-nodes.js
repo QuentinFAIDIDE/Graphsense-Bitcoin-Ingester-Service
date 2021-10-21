@@ -22,6 +22,9 @@ function getBlockHash(btcClient, height) {
 function streamBlockAndTransactions(btcClient, blockHash, blockCallback, transactionCallback) {
     return new Promise((resolve,reject)=>{
         nodeRpcApiWrapper(btcClient, "getblock", [blockHash, 2]).then((block_and_txs)=>{
+            // we will directly go to next block request
+            // iterating over txs (rest of the function) will be done concurrently
+            resolve();
             // send the blockCallback its block
             blockCallback({
                 hash: block_and_txs.hash,
@@ -67,7 +70,6 @@ function streamBlockAndTransactions(btcClient, blockHash, blockCallback, transac
                     is_coinbase: i==0
                 });
             }
-            resolve();
         });
     });
 }
