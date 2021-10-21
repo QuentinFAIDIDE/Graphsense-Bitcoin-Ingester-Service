@@ -1340,9 +1340,15 @@ class CassandraWriter {
                 adtypeid = address_types[etlObj[i].type];
             }
             let value = "0";
+            let addresses = [];
+            if(typeof etlObj[i].addresses == "undefined") {
+                addresses = [];
+            } else {
+                addresses = etlObj[i].addresses;
+            }
             if(etlObj[i].value!=null)value=String(etlObj[i].value);
             graphsenseObj.push({
-                address: etlObj[i].addresses,
+                address: addresses,
                 value: value,
                 address_type: adtypeid
             });
