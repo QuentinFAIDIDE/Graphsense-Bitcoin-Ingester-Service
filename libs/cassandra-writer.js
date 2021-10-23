@@ -686,6 +686,11 @@ class CassandraWriter {
 
         // abort if job is broken
         if(this._jobErrors.hasOwnProperty(jobname)==false || this._jobErrors[jobname].length>0) {
+            this._logErrors("A block was pushed to a dead job at height "+blockObj.number+" : "+JSON.stringify(blockObj));
+            // we wait to let error message propagate to redis despite async call in debug
+            setTimeout(()=>{
+                process.exit(1);
+            },1000);
             return;
         }
 
@@ -872,6 +877,11 @@ class CassandraWriter {
 
         // abort if job is broken
         if(this._jobErrors.hasOwnProperty(jobname)==false || this._jobErrors[jobname].length>0) {
+            this._logErrors("A tx was pushed to a dead job "+jobname+" : "+JSON.stringify(jsonObj));
+            // we wait to let error message propagate to redis despite async call in debug
+            setTimeout(()=>{
+                process.exit(1);
+            },1000);
             return;
         }
 
@@ -895,6 +905,11 @@ class CassandraWriter {
 
             // abort if job is aborted
             if(this._jobErrors.hasOwnProperty(jobname)==false  || this._jobErrors[jobname].length>0) {
+                this._logErrors("A tx was pushed to a dead job (after utxo query) "+jobname+" : "+JSON.stringify(jsonObj));
+                // we wait to let error message propagate to redis despite async call in debug
+                setTimeout(()=>{
+                    process.exit(1);
+                },1000);
                 return;
             }
 
@@ -960,7 +975,14 @@ class CassandraWriter {
             this._cassandraDrivers[keyspace].execute(push_transaction_query, pushParams, {prepare: true})
                 .then(()=>{
 
-                    if(this._jobErrors.hasOwnProperty(jobname)==false)return;
+                    if(this._jobErrors.hasOwnProperty(jobname)==false) {
+                        this._logErrors("A tx was pushed to a dead job (after cassandra write) "+jobname+" : "+JSON.stringify(jsonObj));
+                        // we wait to let error message propagate to redis despite async call in debug
+                        setTimeout(()=>{
+                            process.exit(1);
+                        },1000);
+                        return;
+                    }
                     // metric measuring
                     let responseTime = Date.now()-requestedAt;
                     this._cassandraResponseTimes.number++;
@@ -984,12 +1006,15 @@ class CassandraWriter {
                     // in case the job is aborted due to numerous errors
                     // (shouldn't happen anymore since we decided on crashing the replica after errors)
                     if(this._jobErrors.hasOwnProperty(jobname)==false) {
-                        this._debug("A tx write arrived after too much cassandra errors, ignored.");
+                        this._logErrors("A tx was pushed to a dead job (after cassandra error) "+jobname+" : "+JSON.stringify(jsonObj));
+                        // we wait to let error message propagate to redis despite async call in debug
+                        setTimeout(()=>{
+                            process.exit(1);
+                        },1000);
                         return;
                     }
                     this._manageCassandraErrorsForJob(jobname, err, null, "transaction");
                 });
-
         });
     }
 

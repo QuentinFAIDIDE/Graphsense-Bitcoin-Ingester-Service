@@ -89,7 +89,7 @@ describe("Master feedUntill parameter to post jobs", function () {
 
     this.timeout(5000);
 
-    it("should post 50 jobs", (done)=>{
+    it("should post 150 jobs", (done)=>{
 
         let master = new MasterRole(REDIS_HOST, REDIS_PORT, "TEST30", console.log, console.log, console.log);
         let mult1 = redisClient.multi();
@@ -129,8 +129,8 @@ describe("Master feedUntill parameter to post jobs", function () {
                         redisClient.lrange("TEST30::jobs::posted", 0, -1, (errLR2,resLR2)=>{
 
                             assert.strictEqual(lastRateIngested, yesterday);
-                            assert.strictEqual(resLR1.length, 51);
-                            assert.strictEqual(resLR2.length, 51);
+                            assert.strictEqual(resLR1.length, 150);
+                            assert.strictEqual(resLR2.length, 150);
                             
                             // get the last posted range
                             let lastblock = resLR1[resLR1.length-1].split("::")[2].split(",")[1];
@@ -159,7 +159,7 @@ describe("Master job timeout recovery functionalities", function () {
         mult1.lpush("TEST3::jobs::posted", "0000::ks1::JOB_NAME::2000,3999");
 
         master._getActiveWorkers = ()=>{
-            return new Promise((resolve,reject)=>{resolve(["alive-worker"])});
+            return new Promise((resolve,reject)=>{resolve(["alive-worker"]);});
         };
 
         mult1.exec((errEx,resEx)=>{
@@ -210,7 +210,7 @@ describe("Master job timeout recovery functionalities", function () {
         mult1.lpush("TEST4::jobs::posted", "0000::ks1::JOB_NAME::10000,11999");
 
         master._getActiveWorkers = ()=>{
-            return new Promise((resolve,reject)=>{resolve([])});
+            return new Promise((resolve,reject)=>{resolve([]);});
         };
 
         mult1.exec((errEx,resEx)=>{
