@@ -134,7 +134,7 @@ describe("Master feedUntill parameter to post jobs", function () {
                             
                             // get the last posted range
                             let lastblock = resLR1[resLR1.length-1].split("::")[2].split(",")[1];
-                            assert.strictEqual(lastblock, "100000");
+                            assert.strictEqual(lastblock, "74999");
                             done();
                         });
                     });
