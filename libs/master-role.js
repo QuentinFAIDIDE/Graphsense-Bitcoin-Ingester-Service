@@ -1269,9 +1269,9 @@ class MasterRole {
 
     _rangeSizeForHeight(height) {
         if(height<150000) {
-            return 800;
-        } else if (height<180000) {
             return 500;
+        } else if (height<180000) {
+            return 350;
         } else if (height<230000) {
             return 200;
         } else if (height<300000) {
@@ -1279,7 +1279,7 @@ class MasterRole {
         } else if (height<400000) {
             return 50;
         } else {
-            return 20;
+            return 25;
         }
     }
 }
