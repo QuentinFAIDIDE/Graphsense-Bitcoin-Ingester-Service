@@ -60,7 +60,7 @@ function streamBlockAndTransactions(btcClient, blockHash, blockCallback, transac
                 }
                 // send all the info to the callback
                 transactionCallback({
-                    hash: block_and_txs.tx[i].hash,
+                    hash: block_and_txs.tx[i].txid,
                     block_number: block_and_txs.height,
                     block_timestamp: block_and_txs.time,
                     index: generateTxIndex(block_and_txs.height, i),
