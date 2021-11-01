@@ -1,8 +1,5 @@
 # Bitcoin Ingester Service
-Micro-services that ingest Bitcoin blocks and transactions data in Cassandra following the Graphsense cql schemas (Work in Progress).
-
-
-This software is still in early alpha, some features are missing and you might encounter bugs or suboptimal misconfigurations. Also, it is not an official graphsense project.
+Micro-services that ingest Bitcoin blocks and transactions data in Cassandra following the Graphsense cql schemas. They will continuously run to ingest new blocks as they are created on the Bitcoin blockchain.
 
 ## Usage
 You will need to:
@@ -22,7 +19,7 @@ There are three ways to deploy the service:
 - Advanced deployment in kubernetes
 
 ## Known issue
-- There is a missing total_input value in the lists from the `block_transaction` table when the redis utxo cache is not used (10% of transactions approximately are affected if you are using the utxo cache, 100% if not). This is not fatal to graphsense as this value does not seems to be used, and there is also an option to ignore that table completely.
+- There is a missing total_input value in the lists from the `block_transaction` table when the redis utxo cache is not used. This is not fatal to graphsense transfo, and there is also an option to ignore that table completely. You should use redis utxo cache anyway to save on Cassandra writes.
 - Some schema types has been changed in newer development Graphsense versions and we would need to make it compatible with future releases.
 - Running the transformation cause an overflow on the transaction index despise that it's a big int. A fix is described in the following section.
 
@@ -51,37 +48,6 @@ val transactions = transactionsRaw.sort("txIndex")
   .toDS()
 ```
 
-## Simple Docker Swarm deployment 
-
-This deployment still implies you have an external cassandra deployment to interract with. We also do not persist the redis caches data, you will want to persist it in case of failure for more advanced deployments.
-
-Make sure to be logged into your container registry: 
-```
-docker login registry.gitlab.com -u USERNAME -p <token>
-```
-
-You will also need docker-compose.
-
-
-You then need to choose between the deployment with the utxo cache `docker-compose-utxo.yml` (faster, strongly suggested for full ingesting but uses more RAM) and the vanilla deployment `docker-compose-no-utxo.yml` (less efficient, slower, you would rather activate it only after having ingested the blockchain for continuous updates that required less ram and speed).
-
-
-You need to add in your favourite deployment file the contact points to your cassandra nodes/datacenter and bitcoin nodes, as well as the path to your container registry. Please scroll below to have detailed descriptions of the environment variables to use to set cassandra and bitcoin nodes.
-
-To build and deploy the docker image, set you desired number of replicas and run:
-
-```
-docker-compose up -f docker-compose-utxo.yml
-```
-
-
-```
-./gsingestctl add_keyspace -k btc_raw_05_08_2021 -r 10.35.33.60 -p 32458
-```
-
-```
-./gsingestctl watch_keyspace -k btc_raw -r 10.35.33.60 -p 32458 --save-logs
-```
 
 
 ## Development deployment
@@ -89,11 +55,6 @@ docker-compose up -f docker-compose-utxo.yml
 To install dependencies, run:
 ```bash
 npm install
-```
-
-To install bitcoinetl:
-```bash
-pip3 install bitcoin-etl
 ```
 
 Cqlsh should technically be able to install with pip3, but in practice it doesn't work (at least for the debian stretch we use in dockerfile). If you can't install it with pip3, you can alternatively download it directly from datastax:
@@ -149,13 +110,6 @@ export IGNORE_BLOCK_TRANSACTION="true"
 You can then source the environnement variables and launch the nodejs program:
 ```bash
 source env.sh
-node index.js
-```
-
-If you run into problems with the locales in the `bitcoin-etl` program, temporarly change the following envars before launching the main program:
-```bash
-export LC_ALL="C.UTF-8"
-export LANG="C.UTF-8"
 node index.js
 ```
 
@@ -250,10 +204,6 @@ spec:
               value: "redis-graphsense-ingest-master.graphsense.svc.cluster.local"
             - name: REDIS_PORT
               value: "6379"
-            - name: LC_ALL
-              value: "C.UTF-8"
-            - name: LANG
-              value: "C.UTF-8"
       imagePullSecrets:
         - name: regcred
   strategy:
