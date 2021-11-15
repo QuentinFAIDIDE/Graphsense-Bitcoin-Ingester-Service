@@ -1,4 +1,4 @@
-CREATE KEYSPACE [MY_KEYSPACE_NAME] WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 2}  AND durable_writes = false;
+CREATE KEYSPACE [MY_KEYSPACE_NAME] WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 2};
 
 USE [MY_KEYSPACE_NAME];
 
