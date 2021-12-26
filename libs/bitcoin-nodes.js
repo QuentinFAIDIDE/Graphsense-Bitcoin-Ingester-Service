@@ -38,9 +38,20 @@ function streamBlockAndTransactions(btcClient, blockHash, blockCallback, transac
                 let outputList = [];
                 let sumOutput = 0;
                 for(let j=0; j<block_and_txs.tx[i].vout.length;j++) {
+                    // compute transaction output total
                     sumOutput += block_and_txs.tx[i].vout[j].value;
+                    
+                    let addrs = [];
+                    // new btc node format sometimes send "address" instead of "addresses" so we
+                    // have to adapt depending on the JSON received
+                    if(block_and_txs.tx[i].vout[j].scriptPubKey.hasOwnProperty("address")==true) {
+                        addrs = [block_and_txs.tx[i].vout[j].scriptPubKey.address];
+                    } else if (block_and_txs.tx[i].vout[j].scriptPubKey.hasOwnProperty("addresses")==true) {
+                        addrs = block_and_txs.tx[i].vout[j].scriptPubKey.addresses;
+                    }
+
                     outputList.push({
-                        addresses: block_and_txs.tx[i].vout[j].scriptPubKey.addresses,
+                        addresses: addrs,
                         type: block_and_txs.tx[i].vout[j].scriptPubKey.type,
                         value: btcToSats(block_and_txs.tx[i].vout[j].value)
                     }); 
