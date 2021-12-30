@@ -902,7 +902,7 @@ class CassandraWriter {
 
         // just in case some block has null height (already happen in the past)
         if(Number.isNaN(Number(row.height))==true) {
-            logErrors("A Transaction has null height: "+JSON.stringify(jsonObj,null,2));
+            this._logErrors("A Transaction has null height: "+JSON.stringify(jsonObj,null,2));
             setTimeout(()=>{
                 process.exit(1);
             }, 3000);
